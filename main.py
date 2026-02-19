@@ -98,6 +98,448 @@ async def activate_key(key: str, user_id: int, username: str):
         )
         await db.commit()
         
+        await regenerate_xray_config()
+        return user_path, None
+
+async def get_user_info(user_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT path, user_uuid, is_active FROM users WHERE user_id = ?", (user_id,)
+        )
+        return await cursor.fetchone()
+
+async def get_stats():
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT COUNT(*) FROM users")
+        users = (await cursor.fetchone())[0]
+        cursor = await db.execute("SELECT COUNT(*) FROM keys WHERE is_used = 0")
+        keys = (await cursor.fetchone())[0]
+        return users, keys
+
+async def get_keys_list():
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT key, is_used FROM keys ORDER BY id DESC LIMIT 15"
+        )
+        return await cursor.fetchall()
+
+# ============== XRAY — КРИТИЧЕСКИ ВАЖНАЯ ЧАСТЬ ==============
+async def regenerate_xray_config():
+    """Генерация КОРРЕКТНОГО конфига Xray"""
+    users = await get_all_users()
+    
+    clients = []
+    for user_uuid, path in users:
+        clients.append({
+            "id": user_uuid,
+            "level": 0,
+            "email": "user@example.com"
+        })
+    
+    if not clients:
+        clients.append({
+            "id": str(uuid.uuid4()),
+            "level": 0,
+            "email": "default@example.com"
+        })
+    
+    config = {
+        "log": {
+            "loglevel": "warning",
+            "access": "/tmp/xray_access.log",
+            "error": "/tmp/xray_error.log"
+        },
+        "inbounds": [{
+            "port": XRAY_PORT,
+            "protocol": "vless",
+            "listen": "0.0.0.0",
+            "settings": {
+                "clients": clients,
+                "decryption": "none",
+                "fallbacks": [{
+                    "path": "/fallback",
+                    "dest": 53
+                }]
+            },
+            "streamSettings": {
+                "network": "ws",
+                "wsSettings": {
+                    "path": "/vpn-ws"
+                }
+            },
+            "sniffing": {
+                "enabled": True,
+                "destOverride": ["http", "tls"]
+            }
+        }],
+        "outbounds": [
+            {
+                "protocol": "freedom",
+                "tag": "direct",
+                "settings": {
+                    "domainStrategy": "UseIP"
+                }
+            },
+            {
+                "protocol": "blackhole",
+                "tag": "blocked"
+            }
+        ],
+        "routing": {
+            "domainStrategy": "IPOnDemand",
+            "rules": [
+                {
+                    "type": "field",
+                    "outboundTag": "direct",
+                    "domain": ["geosite:private"]
+                },
+                {
+                    "type": "field",
+                    "outboundTag": "direct",
+                    "ip": ["geoip:private"]
+                },
+                {
+                    "type": "field",
+                    "outboundTag": "blocked",
+                    "domain": ["geosite:category-ads"]
+                }
+            ]
+        },
+        "dns": {
+            "servers": [
+                "8.8.8.8",
+                "1.1.1.1",
+                "119.29.29.29"
+            ]
+        }
+    }
+    
+    with open(XRAY_CONFIG_PATH, "w") as f:
+        json.dump(config, f, indent=2)
+
+def start_xray():
+    """Запуск Xray с правильными параметрами"""
+    try:
+        if os.path.exists("/tmp/xray.pid"):
+            os.remove("/tmp/xray.pid")
+            
+        process = subprocess.Popen(
+            [
+                "xray", 
+                "-config", str(XRAY_CONFIG_PATH),
+                "-configdir", str(DATA_DIR)
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE
+        )
+        print(f"✅ Xray запущен (PID: {process.pid})")
+        return process
+    except Exception as e:
+        print(f"❌ Ошибка запуска Xray: {e}")
+        return None
+
+def generate_vless_link(user_uuid: str):
+    """Генерация ПРАВИЛЬНОЙ ссылки VLESS"""
+    host = BASE_URL.replace("https://", "").replace("http://", "")
+    
+    # 🔑 ВАЖНО: security=none, потому что TLS обрабатывает Render!
+    return f"vless://{user_uuid}@{host}:443?encryption=none&security=none&type=ws&host={host}&path=%2Fvpn-ws#{user_uuid}"
+
+def generate_subscription(user_uuid: str):
+    """Подписка в base64"""
+    link = generate_vless_link(user_uuid)
+    return base64.b64encode(link.encode()).decode()
+
+# ============== WEB СЕРВЕР ==============
+routes = web.RouteTableDef()
+
+@routes.get("/")
+async def index(request):
+    return web.Response(
+        text="🟢 Nefrit VPN is Running<br><a href='/health'>Check Health</a>",
+        content_type="text/html"
+    )
+
+@routes.get("/health")
+async def health(request):
+    return web.json_response({
+        "status": "ok",
+        "xray_config": str(XRAY_CONFIG_PATH.exists())
+    })
+
+@routes.get("/sub/{path}")
+async def subscription(request):
+    path = request.match_info["path"]
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT user_uuid, is_active FROM users WHERE path = ?", (path,)
+        )
+        row = await cursor.fetchone()
+    
+    if not row or not row[1]:
+        return web.Response(text="Not found", status=404)
+    
+    sub = generate_subscription(row[0])
+    return web.Response(
+        text=sub,
+        content_type="text/plain",
+        headers={
+            "Profile-Update-Interval": "6",
+            "Content-Disposition": f"attachment; filename=nefrit_{path}.txt"
+        }
+    )
+
+@routes.get("/vpn-ws")
+async def vpn_ws(request):
+    """Проксирование WebSocket на Xray"""
+    ws = web.WebSocketResponse()
+    await ws.prepare(request)
+    
+    try:
+        async with asyncio.TaskGroup() as tg:
+            # Пересылка клиент -> Xray
+            async def client_to_xray():
+                async for msg in ws:
+                    if msg.type == web.WSMsgType.BINARY:
+                        writer = request.app["xray_writer"]
+                        writer.write(msg.data)
+                        await writer.drain()
+                    elif msg.type == web.WSMsgType.ERROR:
+                        break
+            
+            # Пересылка Xray -> клиент
+            async def xray_to_client():
+                while True:
+                    data = await request.app["xray_reader"].read(65535)
+                    if not data:
+                        break
+                    await ws.send_bytes(data)
+            
+            tg.create_task(client_to_xray())
+            tg.create_task(xray_to_client())
+    except:
+        pass
+    
+    return ws
+
+# ============== TELEGRAM БОТ ==============
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher(storage=MemoryStorage())
+
+class States(StatesGroup):
+    waiting_key = State()
+
+def is_admin(user: types.User) -> bool:
+    return user.username and user.username.lower() == ADMIN_USERNAME.lower()
+
+def main_kb(admin=False):
+    buttons = [
+        [InlineKeyboardButton(text="🔑 Активировать", callback_data="activate")],
+        [InlineKeyboardButton(text="📊 Моя подписка", callback_data="mysub")],
+        [
+            InlineKeyboardButton(text="💬 Поддержка", url=f"https://t.me/{SUPPORT_USERNAME}"),
+            InlineKeyboardButton(text="📢 Канал", url=f"https://t.me/{CHANNEL_USERNAME}")
+        ]
+    ]
+    if admin:
+        buttons.append([InlineKeyboardButton(text="⚙️ Админ", callback_data="admin")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+def admin_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔐 Создать ключ", callback_data="newkey")],
+        [InlineKeyboardButton(text="📋 Ключи", callback_data="keys")],
+        [InlineKeyboardButton(text="📈 Статистика", callback_data="stats")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="back")]
+    ])
+
+@dp.message(CommandStart())
+async def cmd_start(msg: types.Message):
+    await msg.answer(
+        f"🌟 <b>Nefrit VPN</b>\n\nПривет, <b>{msg.from_user.first_name}</b>!\n\n"
+        "🔒 Надежный VPN с реальной скоростью\n🌍 Доступ к любым сайтам",
+        reply_markup=main_kb(is_admin(msg.from_user)),
+        parse_mode="HTML"
+    )
+
+@dp.callback_query(F.data == "back")
+async def go_back(cb: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    await cb.message.edit_text(
+        "🌟 Главное меню",
+        reply_markup=main_kb(is_admin(cb.from_user)),
+        parse_mode="HTML"
+    )
+
+@dp.callback_query(F.data == "activate")
+async def activate(cb: types.CallbackQuery, state: FSMContext):
+    await state.set_state(States.waiting_key)
+    await cb.message.edit_text(
+        "🔑 <b>Введите ключ:</b>\n\n<i>Пример: NEFRIT-A1B2C3D4...</i>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="back")]
+        ]),
+        parse_mode="HTML"
+    )
+
+@dp.message(States.waiting_key)
+async def process_key(msg: types.Message, state: FSMContext):
+    key = msg.text.strip().upper()
+    path, error = await activate_key(key, msg.from_user.id, msg.from_user.username or "")
+    await state.clear()
+    
+    if error:
+        await msg.answer(error, reply_markup=main_kb(is_admin(msg.from_user)))
+    else:
+        info = await get_user_info(msg.from_user.id)
+        link = generate_vless_link(info[1])
+        
+        await msg.answer(
+            f"✅ <b>Подписка активирована!</b>\n\n"
+            f"🔗 <b>Ссылка:</b>\n<code>{BASE_URL}/sub/{path}</code>\n\n"
+            f"📱 <b>Конфиг:</b>\n<code>{link}</code>\n\n"
+            f"<b>Приложения:</b>\n"
+            f"• Android: V2rayNG\n"
+            f"• iOS: Streisand\n"
+            f"• Windows: V2rayN",
+            reply_markup=main_kb(is_admin(msg.from_user)),
+            parse_mode="HTML"
+        )
+
+@dp.callback_query(F.data == "mysub")
+async def my_sub(cb: types.CallbackQuery):
+    info = await get_user_info(cb.from_user.id)
+    if not info:
+        await cb.message.edit_text("❌ Нет подписки", reply_markup=main_kb(is_admin(cb.from_user)))
+    else:
+        link = generate_vless_link(info[1])
+        await cb.message.edit_text(
+            f"📊 <b>Ваша подписка</b>\n\n"
+            f"🔗 <code>{BASE_URL}/sub/{info[0]}</code>\n\n"
+            f"🛡️ <code>{link}</code>",
+            reply_markup=main_kb(is_admin(cb.from_user)),
+            parse_mode="HTML"
+        )
+
+@dp.callback_query(F.data == "admin")
+async def admin_panel(cb: types.CallbackQuery):
+    if not is_admin(cb.from_user):
+        return await cb.answer("⛔ Доступ запрещён", show_alert=True)
+    await cb.message.edit_text("⚙️ Админ-панель", reply_markup=admin_kb())
+
+@dp.callback_query(F.data == "newkey")
+async def new_key(cb: types.CallbackQuery):
+    if not is_admin(cb.from_user):
+        return await cb.answer("⛔", show_alert=True)
+    key = await create_key()
+    await cb.message.edit_text(
+        f"✅ <b>Ключ создан:</b>\n\n<code>{key}</code>",
+        reply_markup=admin_kb(),
+        parse_mode="HTML"
+    )
+
+# ... Остальные хендлеры админки без изменений ...
+
+# ============== ЗАПУСК Xray + WEB + BOT ==============
+async def run_bot():
+    await dp.start_polling(bot)
+
+async def run_web():
+    app = web.Application()
+    app.add_routes(routes)
+    
+    # Запускаем Xray в отдельном процессе и создаем pipe
+    xray_process = start_xray()
+    if not xray_process:
+        print("❌ Не удалось запустить Xray!")
+        return
+    
+    # Создаем pipe для обмена данными с Xray
+    import socket
+    reader, writer = await asyncio.open_connection("127.0.0.1", XRAY_PORT)
+    app["xray_reader"] = reader
+    app["xray_writer"] = writer
+    
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+    print(f"🌐 Web server на порту {PORT}")
+
+async def main():
+    await init_db()
+    await regenerate_xray_config()
+    
+    await asyncio.gather(
+        run_web(),
+        run_bot()
+    )
+
+if __name__ == "__main__":
+    asyncio.run(main())# ============== БАЗА ДАННЫХ ==============
+async def init_db():
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY,
+                user_id INTEGER UNIQUE,
+                username TEXT,
+                user_uuid TEXT UNIQUE,
+                path TEXT UNIQUE,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                is_active BOOLEAN DEFAULT 1
+            )
+        ''')
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS keys (
+                id INTEGER PRIMARY KEY,
+                key TEXT UNIQUE,
+                is_used BOOLEAN DEFAULT 0,
+                used_by INTEGER
+            )
+        ''')
+        await db.commit()
+
+async def create_key():
+    key = f"NEFRIT-{secrets.token_hex(8).upper()}"
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("INSERT INTO keys (key) VALUES (?)", (key,))
+        await db.commit()
+    return key
+
+async def get_all_users():
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT user_uuid, path FROM users WHERE is_active = 1")
+        return await cursor.fetchall()
+
+async def activate_key(key: str, user_id: int, username: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT is_used FROM keys WHERE key = ?", (key,))
+        row = await cursor.fetchone()
+        
+        if not row:
+            return None, "❌ Ключ не найден"
+        if row[0]:
+            return None, "❌ Ключ уже использован"
+        
+        cursor = await db.execute("SELECT path FROM users WHERE user_id = ?", (user_id,))
+        existing = await cursor.fetchone()
+        if existing:
+            return existing[0], None  # Уже есть подписка
+        
+        user_uuid = str(uuid.uuid4())
+        user_path = f"u{user_id}"
+        
+        await db.execute(
+            "INSERT INTO users (user_id, username, user_uuid, path) VALUES (?, ?, ?, ?)",
+            (user_id, username, user_uuid, user_path)
+        )
+        await db.execute(
+            "UPDATE keys SET is_used = 1, used_by = ? WHERE key = ?",
+            (user_id, key)
+        )
+        await db.commit()
+        
         # Перегенерируем конфиг Xray
         await regenerate_xray_config()
         
