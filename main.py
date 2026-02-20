@@ -20,7 +20,6 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# ============== КОНФИГУРАЦИЯ ==============
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "mellfreezy")
 BASE_URL = os.getenv("BASE_URL", "https://nefritvpn.onrender.com")
@@ -35,6 +34,567 @@ XRAY_CONFIG_PATH = DATA_DIR / "xray_config.json"
 SUPPORT_USERNAME = "mellfreezy"
 CHANNEL_USERNAME = "nefrit_vpn"
 
+xray_process = None
+
+
+async def init_db():
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY,
+                user_id INTEGER UNIQUE,
+                username TEXT,
+                user_uuid TEXT UNIQUE,
+                path TEXT UNIQUE,
+                key_id INTEGER,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                expires_at TIMESTAMP,
+                is_active BOOLEAN DEFAULT 1
+            )
+        ''')
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS keys (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                key TEXT UNIQUE,
+                days INTEGER,
+                is_used BOOLEAN DEFAULT 0,
+                used_by INTEGER,
+                used_by_username TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                activated_at TIMESTAMP,
+                expires_at TIMESTAMP,
+                is_revoked BOOLEAN DEFAULT 0
+            )
+        ''')
+        await db.commit()
+
+
+async def create_key(days=None):
+    key = "NEFRIT-" + secrets.token_hex(8).upper()
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("INSERT INTO keys (key, days) VALUES (?, ?)", (key, days))
+        await db.commit()
+        cursor = await db.execute("SELECT id FROM keys WHERE key = ?", (key,))
+        row = await cursor.fetchone()
+        key_id = row[0] if row else None
+    return key, key_id, days
+
+
+async def get_key_info(key_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT id, key, days, is_used, used_by_username, created_at, activated_at, expires_at, is_revoked FROM keys WHERE id = ?",
+            (key_id,)
+        )
+        return await cursor.fetchone()
+
+
+async def revoke_key(key_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE keys SET is_revoked = 1 WHERE id = ?", (key_id,))
+        await db.execute("UPDATE users SET is_active = 0 WHERE key_id = ?", (key_id,))
+        await db.commit()
+    await restart_xray()
+
+
+async def get_all_users():
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT user_uuid, path FROM users WHERE is_active = 1 AND (expires_at IS NULL OR expires_at > datetime('now'))"
+        )
+        return await cursor.fetchall()
+
+
+async def check_expired_users():
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE users SET is_active = 0 WHERE expires_at IS NOT NULL AND expires_at <= datetime('now') AND is_active = 1"
+        )
+        await db.commit()
+
+
+async def activate_key(key, user_id, username):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT id, is_used, days, is_revoked FROM keys WHERE key = ?",
+            (key,)
+        )
+        row = await cursor.fetchone()
+
+        if not row:
+            return None, "Ключ не найден"
+
+        key_id, is_used, days, is_revoked = row
+
+        if is_revoked:
+            return None, "Ключ аннулирован"
+        if is_used:
+            return None, "Ключ уже использован"
+
+        cursor = await db.execute("SELECT path FROM users WHERE user_id = ?", (user_id,))
+        existing = await cursor.fetchone()
+        if existing:
+            return existing[0], None
+
+        user_uuid = str(uuid.uuid4())
+        user_path = "u" + str(user_id)
+
+        now = datetime.now()
+        if days:
+            expires_at = now + timedelta(days=days)
+        else:
+            expires_at = None
+
+        await db.execute(
+            "INSERT INTO users (user_id, username, user_uuid, path, key_id, expires_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (user_id, username, user_uuid, user_path, key_id, expires_at)
+        )
+        await db.execute(
+            "UPDATE keys SET is_used = 1, used_by = ?, used_by_username = ?, activated_at = ?, expires_at = ? WHERE key = ?",
+            (user_id, username, now, expires_at, key)
+        )
+        await db.commit()
+        await restart_xray()
+        return user_path, None
+
+
+async def get_user_info(user_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT path, user_uuid, is_active, expires_at FROM users WHERE user_id = ?",
+            (user_id,)
+        )
+        return await cursor.fetchone()
+
+
+async def get_stats():
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT COUNT(*) FROM users WHERE is_active = 1")
+        active_users = (await cursor.fetchone())[0]
+        cursor = await db.execute("SELECT COUNT(*) FROM users")
+        total_users = (await cursor.fetchone())[0]
+        cursor = await db.execute("SELECT COUNT(*) FROM keys WHERE is_used = 0 AND is_revoked = 0")
+        free_keys = (await cursor.fetchone())[0]
+        cursor = await db.execute("SELECT COUNT(*) FROM keys")
+        total_keys = (await cursor.fetchone())[0]
+        return {
+            "active_users": active_users,
+            "total_users": total_users,
+            "free_keys": free_keys,
+            "total_keys": total_keys
+        }
+
+
+async def get_keys_list():
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT id, key, days, is_used, used_by_username, expires_at, is_revoked, created_at FROM keys ORDER BY id DESC LIMIT 20"
+        )
+        return await cursor.fetchall()
+
+
+async def generate_xray_config():
+    await check_expired_users()
+    users = await get_all_users()
+
+    clients = []
+    for user_uuid, path in users:
+        clients.append({"id": user_uuid, "level": 0})
+
+    if not clients:
+        clients.append({"id": str(uuid.uuid4()), "level": 0})
+
+    config = {
+        "log": {"loglevel": "warning"},
+        "inbounds": [{
+            "port": XRAY_PORT,
+            "listen": "127.0.0.1",
+            "protocol": "vless",
+            "settings": {"clients": clients, "decryption": "none"},
+            "streamSettings": {"network": "ws", "wsSettings": {"path": "/tunnel"}}
+        }],
+        "outbounds": [{"protocol": "freedom", "tag": "direct"}],
+        "dns": {"servers": ["8.8.8.8", "1.1.1.1"]}
+    }
+
+    with open(XRAY_CONFIG_PATH, "w") as f:
+        json.dump(config, f, indent=2)
+    print("Xray config saved with " + str(len(clients)) + " clients")
+
+
+def start_xray():
+    global xray_process
+    if not XRAY_CONFIG_PATH.exists():
+        return False
+    try:
+        xray_process = subprocess.Popen(
+            ["/usr/local/bin/xray", "run", "-config", str(XRAY_CONFIG_PATH)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE
+        )
+        print("Xray started with PID: " + str(xray_process.pid))
+        return True
+    except Exception as e:
+        print("Failed to start Xray: " + str(e))
+        return False
+
+
+def stop_xray():
+    global xray_process
+    if xray_process:
+        xray_process.terminate()
+        xray_process.wait()
+        xray_process = None
+
+
+async def restart_xray():
+    stop_xray()
+    await generate_xray_config()
+    await asyncio.sleep(1)
+    start_xray()
+    await asyncio.sleep(2)
+
+
+def generate_vless_link(user_uuid, user_path):
+    host = BASE_URL.replace("https://", "").replace("http://", "")
+    link = "vless://" + user_uuid + "@" + host + ":443?encryption=none&security=tls&type=ws&host=" + host + "&path=%2Ftunnel#Nefrit-" + user_path
+    return link
+
+
+def generate_subscription(user_uuid, user_path):
+    link = generate_vless_link(user_uuid, user_path)
+    return base64.b64encode(link.encode()).decode()
+
+
+async def handle_index(request):
+    return web.Response(text="<h1>Nefrit VPN Active</h1>", content_type="text/html")
+
+
+async def handle_health(request):
+    xray_ok = xray_process is not None and xray_process.poll() is None
+    return web.json_response({"status": "ok", "xray": xray_ok})
+
+
+async def handle_subscription(request):
+    path = request.match_info["path"]
+    await check_expired_users()
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT user_uuid, is_active, expires_at FROM users WHERE path = ?",
+            (path,)
+        )
+        row = await cursor.fetchone()
+
+    if not row:
+        return web.Response(text="Not found", status=404)
+
+    user_uuid, is_active, expires_at = row
+
+    if not is_active:
+        return web.Response(text="Subscription expired", status=403)
+
+    if expires_at:
+        exp_dt = datetime.fromisoformat(expires_at)
+        if exp_dt <= datetime.now():
+            return web.Response(text="Subscription expired", status=403)
+
+    sub = generate_subscription(user_uuid, path)
+    return web.Response(text=sub, content_type="text/plain", headers={"Profile-Update-Interval": "6"})
+
+
+async def handle_tunnel(request):
+    if request.headers.get("Upgrade", "").lower() != "websocket":
+        return web.Response(text="WebSocket required", status=400)
+
+    ws_client = web.WebSocketResponse()
+    await ws_client.prepare(request)
+
+    try:
+        async with ClientSession() as session:
+            async with session.ws_connect("http://127.0.0.1:" + str(XRAY_PORT) + "/tunnel", timeout=30) as ws_xray:
+
+                async def forward(src, dst):
+                    try:
+                        async for msg in src:
+                            if msg.type == WSMsgType.BINARY:
+                                await dst.send_bytes(msg.data)
+                            elif msg.type == WSMsgType.TEXT:
+                                await dst.send_str(msg.data)
+                            elif msg.type in (WSMsgType.CLOSE, WSMsgType.ERROR):
+                                break
+                    except Exception:
+                        pass
+
+                await asyncio.gather(
+                    forward(ws_client, ws_xray),
+                    forward(ws_xray, ws_client),
+                    return_exceptions=True
+                )
+    except Exception:
+        pass
+    finally:
+        if not ws_client.closed:
+            await ws_client.close()
+
+    return ws_client
+
+
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher(storage=MemoryStorage())
+
+
+class States(StatesGroup):
+    waiting_key = State()
+    waiting_days = State()
+    waiting_revoke_id = State()
+
+
+def is_admin(user):
+    if user.username:
+        return user.username.lower() == ADMIN_USERNAME.lower()
+    return False
+
+
+def main_kb(admin=False):
+    buttons = [
+        [InlineKeyboardButton(text="Aktivovat podpisku", callback_data="activate")],
+        [InlineKeyboardButton(text="Moya podpiska", callback_data="mysub")],
+        [
+            InlineKeyboardButton(text="Podderzhka", url="https://t.me/" + SUPPORT_USERNAME),
+            InlineKeyboardButton(text="Kanal", url="https://t.me/" + CHANNEL_USERNAME)
+        ]
+    ]
+    if admin:
+        buttons.append([InlineKeyboardButton(text="Admin panel", callback_data="admin")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def admin_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Sozdat kluch", callback_data="newkey")],
+        [InlineKeyboardButton(text="Spisok kluchey", callback_data="keys")],
+        [InlineKeyboardButton(text="Annulirovat kluch", callback_data="revoke")],
+        [InlineKeyboardButton(text="Statistika", callback_data="stats")],
+        [InlineKeyboardButton(text="Perezapustit Xray", callback_data="restart_xray")],
+        [InlineKeyboardButton(text="Nazad", callback_data="back")]
+    ])
+
+
+def back_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Menu", callback_data="back")]
+    ])
+
+
+def back_admin_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Admin panel", callback_data="admin")]
+    ])
+
+
+def days_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="7 dney", callback_data="days_7"),
+            InlineKeyboardButton(text="14 dney", callback_data="days_14"),
+            InlineKeyboardButton(text="30 dney", callback_data="days_30")
+        ],
+        [
+            InlineKeyboardButton(text="60 dney", callback_data="days_60"),
+            InlineKeyboardButton(text="90 dney", callback_data="days_90"),
+            InlineKeyboardButton(text="180 dney", callback_data="days_180")
+        ],
+        [InlineKeyboardButton(text="365 dney", callback_data="days_365")],
+        [InlineKeyboardButton(text="Beskonechny", callback_data="days_infinite")],
+        [InlineKeyboardButton(text="Otmena", callback_data="admin")]
+    ])
+
+
+def format_expires(expires_at, is_revoked=False):
+    if is_revoked:
+        return "Annulirovan"
+    if expires_at is None:
+        return "Bessrochno"
+    try:
+        exp_date = datetime.fromisoformat(str(expires_at))
+        now = datetime.now()
+        if exp_date <= now:
+            return "Istek"
+        days = (exp_date - now).days
+        if days == 0:
+            hours = (exp_date - now).seconds // 3600
+            return str(hours) + " chasov"
+        return str(days) + " dney"
+    except Exception:
+        return "?"
+
+
+async def safe_edit(message, text, reply_markup=None):
+    try:
+        await message.edit_text(text, reply_markup=reply_markup, parse_mode="HTML")
+    except TelegramBadRequest:
+        await message.answer(text, reply_markup=reply_markup, parse_mode="HTML")
+
+
+async def safe_send(target, text, reply_markup=None):
+    await target.answer(text, reply_markup=reply_markup, parse_mode="HTML")
+
+
+@dp.message(CommandStart())
+async def cmd_start(msg: types.Message, state: FSMContext):
+    await state.clear()
+    name = msg.from_user.first_name
+    text = "<b>Dobro pozhalovat v Nefrit VPN!</b>\n\n"
+    text += "Privet, <b>" + name + "</b>!\n\n"
+    text += "Bystry i nadezhny VPN\n"
+    text += "Polnaya bezopasnost\n"
+    text += "Dostup k lyubym saytam\n\n"
+    text += "Vyberite deystvie"
+    await msg.answer(text, reply_markup=main_kb(is_admin(msg.from_user)), parse_mode="HTML")
+
+
+@dp.callback_query(F.data == "back")
+async def go_back(cb: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    await safe_edit(cb.message, "<b>Nefrit VPN</b> - Glavnoe menu", reply_markup=main_kb(is_admin(cb.from_user)))
+    await cb.answer()
+
+
+@dp.callback_query(F.data == "activate")
+async def activate(cb: types.CallbackQuery, state: FSMContext):
+    await state.set_state(States.waiting_key)
+    text = "<b>Vvedite vash kluch aktivatsii:</b>\n\n"
+    text += "<i>Primer: NEFRIT-A1B2C3D4E5F6G7H8</i>\n\n"
+    text += "Kluch mozhno poluchit u administratora."
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Otmena", callback_data="back")]
+    ])
+    await safe_edit(cb.message, text, reply_markup=kb)
+    await cb.answer()
+
+
+@dp.message(States.waiting_key)
+async def process_key(msg: types.Message, state: FSMContext):
+    key = msg.text.strip().upper()
+    username = msg.from_user.username or msg.from_user.first_name
+    path, error = await activate_key(key, msg.from_user.id, username)
+    await state.clear()
+
+    if error:
+        await safe_send(msg, "Error: " + error, reply_markup=back_kb())
+        return
+
+    info = await get_user_info(msg.from_user.id)
+    if not info:
+        await safe_send(msg, "Oshibka polucheniya dannyh", reply_markup=back_kb())
+        return
+
+    path, user_uuid, is_active, expires_at = info
+    link = generate_vless_link(user_uuid, path)
+    sub_url = BASE_URL + "/sub/" + path
+
+    if expires_at:
+        exp_date = datetime.fromisoformat(str(expires_at))
+        exp_info = "\nDeystvuet do: " + exp_date.strftime("%d.%m.%Y %H:%M")
+    else:
+        exp_info = "\nSrok: Bessrochno"
+
+    text = "<b>Podpiska aktivirovana!</b>" + exp_info + "\n\n"
+    text += "<b>Ssylka podpiski:</b>\n<code>" + sub_url + "</code>\n\n"
+    text += "<b>Pryamoy config:</b>\n<code>" + link + "</code>\n\n"
+    text += "<b>Kak podklyuchitsya:</b>\n"
+    text += "Android: V2rayNG\n"
+    text += "iOS: Streisand / V2Box\n"
+    text += "Windows: V2rayN\n"
+    text += "macOS: V2rayU"
+
+    await safe_send(msg, text, reply_markup=back_kb())
+
+
+@dp.callback_query(F.data == "mysub")
+async def my_sub(cb: types.CallbackQuery):
+    await check_expired_users()
+    info = await get_user_info(cb.from_user.id)
+
+    if not info:
+        text = "<b>U vas net aktivnoy podpiski</b>\n\n"
+        text += "Nazhmite Aktivirovat podpisku dlya aktivatsii."
+        await safe_edit(cb.message, text, reply_markup=back_kb())
+        await cb.answer()
+        return
+
+    path, user_uuid, is_active, expires_at = info
+    link = generate_vless_link(user_uuid, path)
+    sub_url = BASE_URL + "/sub/" + path
+
+    if is_active:
+        status = "Aktivna"
+    else:
+        status = "Neaktivna"
+
+    if expires_at:
+        exp_date = datetime.fromisoformat(str(expires_at))
+        now = datetime.now()
+        if exp_date > now:
+            days_left = (exp_date - now).days
+            exp_str = exp_date.strftime("%d.%m.%Y") + " (" + str(days_left) + " dn.)"
+        else:
+            exp_str = "Istek"
+    else:
+        exp_str = "Bessrochno"
+
+    text = "<b>Vasha podpiska</b>\n\n"
+    text += "Status: " + status + "\n"
+    text += "Srok: " + exp_str + "\n"
+    text += "ID: " + path + "\n\n"
+    text += "<b>Ssylka podpiski:</b>\n<code>" + sub_url + "</code>\n\n"
+    text += "<b>Config:</b>\n<code>" + link + "</code>"
+
+    await safe_edit(cb.message, text, reply_markup=back_kb())
+    await cb.answer()
+
+
+@dp.callback_query(F.data == "admin")
+async def admin_panel(cb: types.CallbackQuery, state: FSMContext):
+    if not is_admin(cb.from_user):
+        await cb.answer("Dostup zapreschen", show_alert=True)
+        return
+
+    await state.clear()
+    stats = await get_stats()
+    xray_ok = xray_process is not None and xray_process.poll() is None
+
+    if xray_ok:
+        xray_status = "Rabotaet"
+    else:
+        xray_status = "Ostanovlen"
+
+    text = "<b>Admin panel</b>\n\n"
+    text += "Aktivnyh: " + str(stats["active_users"]) + " / " + str(stats["total_users"]) + "\n"
+    text += "Svobodnyh kluchey: " + str(stats["free_keys"]) + " / " + str(stats["total_keys"]) + "\n"
+    text += "Xray: " + xray_status
+
+    await safe_edit(cb.message, text, reply_markup=admin_kb())
+    await cb.answer()
+
+
+@dp.callback_query(F.data == "newkey")
+async def new_key_start(cb: types.CallbackQuery, state: FSMContext):
+    if not is_admin(cb.from_user):
+        await cb.answer("Dostup zapreschen", show_alert=True)
+        return
+
+    await state.set_state(States.waiting_days)
+    text = "<b>Sozdanie klucha</b>\n\n"
+    text += "Vyberite srok deystviya ili vvedite chislo dney:"
+    await safe_edit(cb.message, text, reply_markup=days_kb())
+    await cb.answer()
+
+
+@dp.callback_query(F.data.startswith("days_"))
+async def process_days_button(cb: types.CallbackQuery, state: FSMContext):
+    if not is_admin(cb
 xray_process = None
 
 
