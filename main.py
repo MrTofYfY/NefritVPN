@@ -1136,7 +1136,7 @@ async def admin_panel(cb: types.CallbackQuery, state: FSMContext):
         cb.message,
         f"⚙️ <b>Админ-панель</b>\n\n"
         f"👥 Активных: {stats['active_users']} / {stats['total_users']}\n"
-        f"🔑 Свободных ключеxray_process = None
+f"🔑 Ключей: {stats['free_keys']} / {stats['total_keys']}\n"
 
 # ============== БАЗА ДАННЫХ ==============
 async def init_db():
