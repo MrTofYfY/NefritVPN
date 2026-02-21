@@ -36,10 +36,10 @@ SUPPORT_USERNAME = "mellfreezy"
 CHANNEL_USERNAME = "nefrit_vpn"
 
 PRICES = {
-    "week": {"days": 7, "stars": 5, "name": "1 nedelya"},
-    "month": {"days": 30, "stars": 10, "name": "1 mesyac"},
-    "year": {"days": 365, "stars": 100, "name": "1 god"},
-    "forever": {"days": None, "stars": 300, "name": "Navsegda"}
+    "week": {"days": 7, "stars": 5, "name": "1 неделя"},
+    "month": {"days": 30, "stars": 10, "name": "1 месяц"},
+    "year": {"days": 365, "stars": 100, "name": "1 год"},
+    "forever": {"days": None, "stars": 300, "name": "Навсегда"}
 }
 
 xray_process = None
@@ -55,43 +55,40 @@ class States(StatesGroup):
 
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute('''
-            CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY,
-                user_id INTEGER UNIQUE,
-                username TEXT,
-                user_uuid TEXT UNIQUE,
-                path TEXT UNIQUE,
-                key_id INTEGER,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                expires_at TIMESTAMP,
-                is_active BOOLEAN DEFAULT 1
-            )
-        ''')
-        await db.execute('''
-            CREATE TABLE IF NOT EXISTS keys (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                key TEXT UNIQUE,
-                days INTEGER,
-                is_used BOOLEAN DEFAULT 0,
-                used_by INTEGER,
-                used_by_username TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                activated_at TIMESTAMP,
-                expires_at TIMESTAMP,
-                is_revoked BOOLEAN DEFAULT 0
-            )
-        ''')
-        await db.execute('''
-            CREATE TABLE IF NOT EXISTS payments (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER,
-                username TEXT,
-                amount INTEGER,
-                plan TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
+        await db.execute(
+            "CREATE TABLE IF NOT EXISTS users ("
+            "id INTEGER PRIMARY KEY, "
+            "user_id INTEGER UNIQUE, "
+            "username TEXT, "
+            "user_uuid TEXT UNIQUE, "
+            "path TEXT UNIQUE, "
+            "key_id INTEGER, "
+            "created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, "
+            "expires_at TIMESTAMP, "
+            "is_active BOOLEAN DEFAULT 1)"
+        )
+        await db.execute(
+            "CREATE TABLE IF NOT EXISTS keys ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "key TEXT UNIQUE, "
+            "days INTEGER, "
+            "is_used BOOLEAN DEFAULT 0, "
+            "used_by INTEGER, "
+            "used_by_username TEXT, "
+            "created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, "
+            "activated_at TIMESTAMP, "
+            "expires_at TIMESTAMP, "
+            "is_revoked BOOLEAN DEFAULT 0)"
+        )
+        await db.execute(
+            "CREATE TABLE IF NOT EXISTS payments ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "user_id INTEGER, "
+            "username TEXT, "
+            "amount INTEGER, "
+            "plan TEXT, "
+            "created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)"
+        )
         await db.commit()
 
 
@@ -200,7 +197,7 @@ async def activate_key(key, user_id, username):
         row = await cursor.fetchone()
 
         if not row:
-            return None, "Kluch ne nayden"
+            return None, "Ключ не найден"
 
         key_id = row[0]
         is_used = row[1]
@@ -208,9 +205,9 @@ async def activate_key(key, user_id, username):
         is_revoked = row[3]
 
         if is_revoked:
-            return None, "Kluch annulirovan"
+            return None, "Ключ аннулирован"
         if is_used:
-            return None, "Kluch uzhe ispolzovan"
+            return None, "Ключ уже использован"
 
         cursor = await db.execute("SELECT path FROM users WHERE user_id = ?", (user_id,))
         existing = await cursor.fetchone()
@@ -309,25 +306,19 @@ async def generate_xray_config():
     with open(XRAY_CONFIG_PATH, "w") as f:
         json.dump(config, f, indent=2)
 
-    print("Xray config: " + str(len(clients)) + " clients")
-
 
 def start_xray():
     global xray_process
-
     if not XRAY_CONFIG_PATH.exists():
         return False
-
     try:
         xray_process = subprocess.Popen(
             ["/usr/local/bin/xray", "run", "-config", str(XRAY_CONFIG_PATH)],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE
         )
-        print("Xray PID: " + str(xray_process.pid))
         return True
-    except Exception as e:
-        print("Xray error: " + str(e))
+    except:
         return False
 
 
@@ -362,7 +353,7 @@ def generate_subscription(user_uuid, user_path):
 
 
 async def handle_index(request):
-    return web.Response(text="<h1>Nefrit VPN Active</h1>", content_type="text/html")
+    return web.Response(text="Nefrit VPN Active", content_type="text/html")
 
 
 async def handle_health(request):
@@ -438,99 +429,99 @@ def is_admin(user):
 
 def main_kb(admin=False):
     buttons = [
-        [InlineKeyboardButton(text="Kupit podpisku", callback_data="buy")],
-        [InlineKeyboardButton(text="Aktivirovat kluch", callback_data="activate")],
-        [InlineKeyboardButton(text="Moya podpiska", callback_data="mysub")],
+        [InlineKeyboardButton(text="Купить подписку", callback_data="buy")],
+        [InlineKeyboardButton(text="Активировать ключ", callback_data="activate")],
+        [InlineKeyboardButton(text="Моя подписка", callback_data="mysub")],
         [
-            InlineKeyboardButton(text="Podderzhka", url="https://t.me/" + SUPPORT_USERNAME),
-            InlineKeyboardButton(text="Kanal", url="https://t.me/" + CHANNEL_USERNAME)
+            InlineKeyboardButton(text="Поддержка", url="https://t.me/" + SUPPORT_USERNAME),
+            InlineKeyboardButton(text="Канал", url="https://t.me/" + CHANNEL_USERNAME)
         ]
     ]
     if admin:
-        buttons.append([InlineKeyboardButton(text="Admin panel", callback_data="admin")])
+        buttons.append([InlineKeyboardButton(text="Админ-панель", callback_data="admin")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
 def buy_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="1 nedelya - 5 zvezd", callback_data="pay_week")],
-        [InlineKeyboardButton(text="1 mesyac - 10 zvezd", callback_data="pay_month")],
-        [InlineKeyboardButton(text="1 god - 100 zvezd", callback_data="pay_year")],
-        [InlineKeyboardButton(text="Navsegda - 300 zvezd", callback_data="pay_forever")],
-        [InlineKeyboardButton(text="Nazad", callback_data="back")]
+        [InlineKeyboardButton(text="1 неделя - 5 звёзд", callback_data="pay_week")],
+        [InlineKeyboardButton(text="1 месяц - 10 звёзд", callback_data="pay_month")],
+        [InlineKeyboardButton(text="1 год - 100 звёзд", callback_data="pay_year")],
+        [InlineKeyboardButton(text="Навсегда - 300 звёзд", callback_data="pay_forever")],
+        [InlineKeyboardButton(text="Назад", callback_data="back")]
     ])
 
 
 def admin_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Sozdat kluch", callback_data="newkey")],
-        [InlineKeyboardButton(text="Vse kluchi", callback_data="keys")],
-        [InlineKeyboardButton(text="Statistika", callback_data="stats")],
-        [InlineKeyboardButton(text="Restart Xray", callback_data="restart_xray")],
-        [InlineKeyboardButton(text="Nazad", callback_data="back")]
+        [InlineKeyboardButton(text="Создать ключ", callback_data="newkey")],
+        [InlineKeyboardButton(text="Все ключи", callback_data="keys")],
+        [InlineKeyboardButton(text="Статистика", callback_data="stats")],
+        [InlineKeyboardButton(text="Перезапустить Xray", callback_data="restart_xray")],
+        [InlineKeyboardButton(text="Назад", callback_data="back")]
     ])
 
 
 def days_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="7 dney", callback_data="mkkey_7"),
-            InlineKeyboardButton(text="14 dney", callback_data="mkkey_14"),
-            InlineKeyboardButton(text="30 dney", callback_data="mkkey_30")
+            InlineKeyboardButton(text="7 дней", callback_data="mkkey_7"),
+            InlineKeyboardButton(text="14 дней", callback_data="mkkey_14"),
+            InlineKeyboardButton(text="30 дней", callback_data="mkkey_30")
         ],
         [
-            InlineKeyboardButton(text="60 dney", callback_data="mkkey_60"),
-            InlineKeyboardButton(text="90 dney", callback_data="mkkey_90"),
-            InlineKeyboardButton(text="180 dney", callback_data="mkkey_180")
+            InlineKeyboardButton(text="60 дней", callback_data="mkkey_60"),
+            InlineKeyboardButton(text="90 дней", callback_data="mkkey_90"),
+            InlineKeyboardButton(text="180 дней", callback_data="mkkey_180")
         ],
-        [InlineKeyboardButton(text="365 dney", callback_data="mkkey_365")],
-        [InlineKeyboardButton(text="Bessrochno", callback_data="mkkey_0")],
-        [InlineKeyboardButton(text="Otmena", callback_data="admin")]
+        [InlineKeyboardButton(text="365 дней", callback_data="mkkey_365")],
+        [InlineKeyboardButton(text="Бессрочно", callback_data="mkkey_0")],
+        [InlineKeyboardButton(text="Отмена", callback_data="admin")]
     ])
 
 
 def back_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Menu", callback_data="back")]
+        [InlineKeyboardButton(text="Меню", callback_data="back")]
     ])
 
 
 def back_admin_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Admin", callback_data="admin")]
+        [InlineKeyboardButton(text="Админ-панель", callback_data="admin")]
     ])
 
 
 def cancel_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Otmena", callback_data="back")]
+        [InlineKeyboardButton(text="Отмена", callback_data="back")]
     ])
 
 
 def confirm_revoke_kb(key_id):
     return InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="Da, udalit", callback_data="confirmrev_" + str(key_id)),
-            InlineKeyboardButton(text="Net", callback_data="keys")
+            InlineKeyboardButton(text="Да, удалить", callback_data="confirmrev_" + str(key_id)),
+            InlineKeyboardButton(text="Нет", callback_data="keys")
         ]
     ])
 
 
 def format_expiry(expires_at, is_revoked):
     if is_revoked:
-        return "Annulirovan"
+        return "Аннулирован"
     if not expires_at:
-        return "Bessrochno"
+        return "Бессрочно"
     try:
         exp = datetime.fromisoformat(expires_at)
         now = datetime.now()
         if exp <= now:
-            return "Istek"
+            return "Истёк"
         diff = (exp - now).days
         if diff == 0:
             hours = (exp - now).seconds // 3600
-            return str(hours) + "h"
-        return str(diff) + "d"
+            return str(hours) + " ч."
+        return str(diff) + " дн."
     except:
         return "?"
 
@@ -551,28 +542,29 @@ async def cmd_start(msg: types.Message, state: FSMContext):
     await state.clear()
     name = msg.from_user.first_name
     text = "<b>Nefrit VPN</b>\n\n"
-    text = text + "Dobro pozhalovat, " + name + "!\n\n"
-    text = text + "Bystry i nadezhny VPN servis.\n\n"
-    text = text + "Vyberite deystvie:"
+    text = text + "Добро пожаловать, " + str(name) + "!\n\n"
+    text = text + "Быстрый и надёжный VPN сервис.\n\n"
+    text = text + "Выберите действие:"
     await msg.answer(text, reply_markup=main_kb(is_admin(msg.from_user)), parse_mode="HTML")
 
 
 @dp.callback_query(F.data == "back")
 async def go_back(cb: types.CallbackQuery, state: FSMContext):
     await state.clear()
-    await safe_edit(cb.message, "<b>Nefrit VPN</b>\n\nGlavnoe menu", main_kb(is_admin(cb.from_user)))
+    text = "<b>Nefrit VPN</b>\n\nГлавное меню"
+    await safe_edit(cb.message, text, main_kb(is_admin(cb.from_user)))
     await cb.answer()
 
 
 @dp.callback_query(F.data == "buy")
 async def buy_menu(cb: types.CallbackQuery):
-    text = "<b>Kupit podpisku</b>\n\n"
-    text = text + "Vyberite tarif:\n\n"
-    text = text + "1 nedelya - 5 zvezd\n"
-    text = text + "1 mesyac - 10 zvezd\n"
-    text = text + "1 god - 100 zvezd\n"
-    text = text + "Navsegda - 300 zvezd\n\n"
-    text = text + "Oplata cherez Telegram Stars"
+    text = "<b>Купить подписку</b>\n\n"
+    text = text + "Выберите тариф:\n\n"
+    text = text + "1 неделя - 5 звёзд\n"
+    text = text + "1 месяц - 10 звёзд\n"
+    text = text + "1 год - 100 звёзд\n"
+    text = text + "Навсегда - 300 звёзд\n\n"
+    text = text + "Оплата через Telegram Stars"
     await safe_edit(cb.message, text, buy_kb())
     await cb.answer()
 
@@ -582,7 +574,7 @@ async def process_payment(cb: types.CallbackQuery):
     plan = cb.data.replace("pay_", "")
 
     if plan not in PRICES:
-        await cb.answer("Oshibka", show_alert=True)
+        await cb.answer("Ошибка", show_alert=True)
         return
 
     price_info = PRICES[plan]
@@ -594,7 +586,7 @@ async def process_payment(cb: types.CallbackQuery):
     await bot.send_invoice(
         chat_id=cb.from_user.id,
         title="Nefrit VPN - " + name,
-        description="Podpiska na VPN: " + name,
+        description="Подписка на VPN: " + name,
         payload="vpn_" + plan,
         provider_token="",
         currency="XTR",
@@ -615,7 +607,7 @@ async def successful_payment(msg: types.Message):
     plan = payload.replace("vpn_", "")
 
     if plan not in PRICES:
-        await msg.answer("Oshibka obraotki platezha")
+        await msg.answer("Ошибка обработки платежа")
         return
 
     price_info = PRICES[plan]
@@ -632,7 +624,7 @@ async def successful_payment(msg: types.Message):
 
     info = await get_user_info(msg.from_user.id)
     if not info:
-        await msg.answer("Oshibka sozdaniya podpiski")
+        await msg.answer("Ошибка создания подписки")
         return
 
     user_uuid = info[1]
@@ -643,18 +635,18 @@ async def successful_payment(msg: types.Message):
 
     if expires_at:
         exp = datetime.fromisoformat(expires_at)
-        exp_str = "Deystvuet do: " + exp.strftime("%d.%m.%Y %H:%M")
+        exp_str = "Действует до: " + exp.strftime("%d.%m.%Y %H:%M")
     else:
-        exp_str = "Srok: Bessrochno"
+        exp_str = "Срок: Бессрочно"
 
-    text = "<b>Oplata prinyata!</b>\n\n"
-    text = text + "Spasibo za pokupku!\n\n"
+    text = "<b>Оплата принята!</b>\n\n"
+    text = text + "Спасибо за покупку!\n\n"
     text = text + exp_str + "\n\n"
-    text = text + "<b>Ssylka podpiski:</b>\n"
+    text = text + "<b>Ссылка подписки:</b>\n"
     text = text + "<code>" + sub_url + "</code>\n\n"
-    text = text + "<b>Config:</b>\n"
+    text = text + "<b>Конфиг:</b>\n"
     text = text + "<code>" + link + "</code>\n\n"
-    text = text + "<b>Prilozheniya:</b>\n"
+    text = text + "<b>Приложения:</b>\n"
     text = text + "Android: V2rayNG\n"
     text = text + "iOS: Streisand / V2Box\n"
     text = text + "Windows: V2rayN"
@@ -665,8 +657,8 @@ async def successful_payment(msg: types.Message):
 @dp.callback_query(F.data == "activate")
 async def activate(cb: types.CallbackQuery, state: FSMContext):
     await state.set_state(States.waiting_key)
-    text = "<b>Vvedite kluch aktivatsii:</b>\n\n"
-    text = text + "Primer: NEFRIT-A1B2C3D4E5F6G7H8"
+    text = "<b>Введите ключ активации:</b>\n\n"
+    text = text + "Пример: NEFRIT-A1B2C3D4E5F6G7H8"
     await safe_edit(cb.message, text, cancel_kb())
     await cb.answer()
 
@@ -680,12 +672,12 @@ async def process_key(msg: types.Message, state: FSMContext):
     await state.clear()
 
     if error:
-        await safe_send(msg, "Oshibka: " + error, back_kb())
+        await safe_send(msg, "Ошибка: " + error, back_kb())
         return
 
     info = await get_user_info(msg.from_user.id)
     if not info:
-        await safe_send(msg, "Oshibka", back_kb())
+        await safe_send(msg, "Ошибка", back_kb())
         return
 
     user_uuid = info[1]
@@ -696,14 +688,14 @@ async def process_key(msg: types.Message, state: FSMContext):
 
     if expires_at:
         exp = datetime.fromisoformat(expires_at)
-        exp_str = "Deystvuet do: " + exp.strftime("%d.%m.%Y %H:%M")
+        exp_str = "Действует до: " + exp.strftime("%d.%m.%Y %H:%M")
     else:
-        exp_str = "Srok: Bessrochno"
+        exp_str = "Срок: Бессрочно"
 
-    text = "<b>Podpiska aktivirovana!</b>\n\n"
+    text = "<b>Подписка активирована!</b>\n\n"
     text = text + exp_str + "\n\n"
-    text = text + "<b>Ssylka:</b>\n<code>" + sub_url + "</code>\n\n"
-    text = text + "<b>Config:</b>\n<code>" + link + "</code>"
+    text = text + "<b>Ссылка:</b>\n<code>" + sub_url + "</code>\n\n"
+    text = text + "<b>Конфиг:</b>\n<code>" + link + "</code>"
 
     await safe_send(msg, text, back_kb())
 
@@ -713,7 +705,7 @@ async def my_sub(cb: types.CallbackQuery):
     info = await get_user_info(cb.from_user.id)
 
     if not info:
-        text = "<b>U vas net podpiski</b>\n\nKupite ili aktiviruyte kluch."
+        text = "<b>У вас нет подписки</b>\n\nКупите или активируйте ключ."
         await safe_edit(cb.message, text, back_kb())
         await cb.answer()
         return
@@ -726,24 +718,24 @@ async def my_sub(cb: types.CallbackQuery):
     link = generate_vless_link(user_uuid, user_path)
     sub_url = BASE_URL + "/sub/" + user_path
 
-    status = "Aktivna" if is_active else "Neaktivna"
+    status = "Активна" if is_active else "Неактивна"
 
     if expires_at:
         exp = datetime.fromisoformat(expires_at)
         now = datetime.now()
         if exp > now:
             diff = (exp - now).days
-            exp_str = exp.strftime("%d.%m.%Y") + " (" + str(diff) + " dn.)"
+            exp_str = exp.strftime("%d.%m.%Y") + " (" + str(diff) + " дн.)"
         else:
-            exp_str = "Istek"
+            exp_str = "Истёк"
     else:
-        exp_str = "Bessrochno"
+        exp_str = "Бессрочно"
 
-    text = "<b>Vasha podpiska</b>\n\n"
-    text = text + "Status: " + status + "\n"
-    text = text + "Srok: " + exp_str + "\n\n"
-    text = text + "<b>URL:</b>\n<code>" + sub_url + "</code>\n\n"
-    text = text + "<b>Config:</b>\n<code>" + link + "</code>"
+    text = "<b>Ваша подписка</b>\n\n"
+    text = text + "Статус: " + status + "\n"
+    text = text + "Срок: " + exp_str + "\n\n"
+    text = text + "<b>Ссылка:</b>\n<code>" + sub_url + "</code>\n\n"
+    text = text + "<b>Конфиг:</b>\n<code>" + link + "</code>"
 
     await safe_edit(cb.message, text, back_kb())
     await cb.answer()
@@ -752,19 +744,19 @@ async def my_sub(cb: types.CallbackQuery):
 @dp.callback_query(F.data == "admin")
 async def admin_panel(cb: types.CallbackQuery, state: FSMContext):
     if not is_admin(cb.from_user):
-        await cb.answer("Net dostupa", show_alert=True)
+        await cb.answer("Нет доступа", show_alert=True)
         return
 
     await state.clear()
     active, total, free_keys, total_keys, total_stars = await get_stats()
 
     xray_ok = xray_process is not None and xray_process.poll() is None
-    xray_status = "OK" if xray_ok else "OFF"
+    xray_status = "Работает" if xray_ok else "Остановлен"
 
-    text = "<b>Admin panel</b>\n\n"
-    text = text + "Polzovateley: " + str(active) + " / " + str(total) + "\n"
-    text = text + "Kluchey: " + str(free_keys) + " / " + str(total_keys) + "\n"
-    text = text + "Zarabotano zvezd: " + str(total_stars) + "\n"
+    text = "<b>Админ-панель</b>\n\n"
+    text = text + "Пользователей: " + str(active) + " / " + str(total) + "\n"
+    text = text + "Ключей: " + str(free_keys) + " / " + str(total_keys) + "\n"
+    text = text + "Заработано звёзд: " + str(total_stars) + "\n"
     text = text + "Xray: " + xray_status
 
     await safe_edit(cb.message, text, admin_kb())
@@ -774,12 +766,12 @@ async def admin_panel(cb: types.CallbackQuery, state: FSMContext):
 @dp.callback_query(F.data == "newkey")
 async def new_key_menu(cb: types.CallbackQuery, state: FSMContext):
     if not is_admin(cb.from_user):
-        await cb.answer("Net dostupa", show_alert=True)
+        await cb.answer("Нет доступа", show_alert=True)
         return
 
     await state.set_state(States.waiting_days)
-    text = "<b>Sozdanie klucha</b>\n\n"
-    text = text + "Vyberite srok deystviya:"
+    text = "<b>Создание ключа</b>\n\n"
+    text = text + "Выберите срок действия:"
     await safe_edit(cb.message, text, days_kb())
     await cb.answer()
 
@@ -787,25 +779,25 @@ async def new_key_menu(cb: types.CallbackQuery, state: FSMContext):
 @dp.callback_query(F.data.startswith("mkkey_"))
 async def create_key_handler(cb: types.CallbackQuery, state: FSMContext):
     if not is_admin(cb.from_user):
-        await cb.answer("Net dostupa", show_alert=True)
+        await cb.answer("Нет доступа", show_alert=True)
         return
 
     val = cb.data.replace("mkkey_", "")
 
     if val == "0":
         days = None
-        days_str = "Bessrochno"
+        days_str = "Бессрочно"
     else:
         days = int(val)
-        days_str = str(days) + " dney"
+        days_str = str(days) + " дней"
 
     await state.clear()
     key, key_id = await create_key(days)
 
-    text = "<b>Kluch sozdan!</b>\n\n"
+    text = "<b>Ключ создан!</b>\n\n"
     text = text + "ID: #" + str(key_id) + "\n"
-    text = text + "Kluch: <code>" + key + "</code>\n"
-    text = text + "Srok: " + days_str
+    text = text + "Ключ: <code>" + key + "</code>\n"
+    text = text + "Срок: " + days_str
 
     await safe_edit(cb.message, text, back_admin_kb())
     await cb.answer()
@@ -819,19 +811,19 @@ async def process_days_manual(msg: types.Message, state: FSMContext):
     try:
         days = int(msg.text.strip())
         if days <= 0:
-            await safe_send(msg, "Vvedite polozhitelnoe chislo", back_admin_kb())
+            await safe_send(msg, "Введите положительное число", back_admin_kb())
             return
     except:
-        await safe_send(msg, "Vvedite chislo", back_admin_kb())
+        await safe_send(msg, "Введите число", back_admin_kb())
         return
 
     await state.clear()
     key, key_id = await create_key(days)
 
-    text = "<b>Kluch sozdan!</b>\n\n"
+    text = "<b>Ключ создан!</b>\n\n"
     text = text + "ID: #" + str(key_id) + "\n"
-    text = text + "Kluch: <code>" + key + "</code>\n"
-    text = text + "Srok: " + str(days) + " dney"
+    text = text + "Ключ: <code>" + key + "</code>\n"
+    text = text + "Срок: " + str(days) + " дней"
 
     await safe_send(msg, text, back_admin_kb())
 
@@ -839,18 +831,18 @@ async def process_days_manual(msg: types.Message, state: FSMContext):
 @dp.callback_query(F.data == "keys")
 async def list_keys(cb: types.CallbackQuery):
     if not is_admin(cb.from_user):
-        await cb.answer("Net dostupa", show_alert=True)
+        await cb.answer("Нет доступа", show_alert=True)
         return
 
     keys = await get_keys_list()
 
     if not keys:
-        text = "<b>Kluchey net</b>"
+        text = "<b>Ключей нет</b>"
         await safe_edit(cb.message, text, back_admin_kb())
         await cb.answer()
         return
 
-    text = "<b>Vse kluchi:</b>\n\nNazhmite dlya udaleniya:"
+    text = "<b>Все ключи:</b>\n\nНажмите для удаления:"
 
     buttons = []
     for row in keys:
@@ -873,7 +865,7 @@ async def list_keys(cb: types.CallbackQuery):
             days_str = str(days) + "d"
 
         if username:
-            user_str = "@" + username
+            user_str = "@" + str(username)
         elif is_used:
             user_str = "?"
         else:
@@ -882,7 +874,7 @@ async def list_keys(cb: types.CallbackQuery):
         btn_text = "[" + status + "] #" + str(key_id) + " " + days_str + " " + user_str
         buttons.append([InlineKeyboardButton(text=btn_text, callback_data="keyinfo_" + str(key_id))])
 
-    buttons.append([InlineKeyboardButton(text="Nazad", callback_data="admin")])
+    buttons.append([InlineKeyboardButton(text="Назад", callback_data="admin")])
 
     await safe_edit(cb.message, text, InlineKeyboardMarkup(inline_keyboard=buttons))
     await cb.answer()
@@ -891,14 +883,14 @@ async def list_keys(cb: types.CallbackQuery):
 @dp.callback_query(F.data.startswith("keyinfo_"))
 async def key_info(cb: types.CallbackQuery):
     if not is_admin(cb.from_user):
-        await cb.answer("Net dostupa", show_alert=True)
+        await cb.answer("Нет доступа", show_alert=True)
         return
 
     key_id = int(cb.data.replace("keyinfo_", ""))
     info = await get_key_info(key_id)
 
     if not info:
-        await cb.answer("Kluch ne nayden", show_alert=True)
+        await cb.answer("Ключ не найден", show_alert=True)
         return
 
     key = info[1]
@@ -909,33 +901,33 @@ async def key_info(cb: types.CallbackQuery):
     is_revoked = info[6]
 
     if is_revoked:
-        status = "Annulirovan"
+        status = "Аннулирован"
     elif is_used:
-        status = "Ispolzovan"
+        status = "Использован"
     else:
-        status = "Svoboden"
+        status = "Свободен"
 
     if days is None:
-        days_str = "Bessrochno"
+        days_str = "Бессрочно"
     else:
-        days_str = str(days) + " dney"
+        days_str = str(days) + " дней"
 
     if username:
-        user_str = "@" + username
+        user_str = "@" + str(username)
     else:
         user_str = "-"
 
     exp_str = format_expiry(expires_at, is_revoked)
 
-    text = "<b>Kluch #" + str(key_id) + "</b>\n\n"
-    text = text + "Kluch: <code>" + key + "</code>\n"
-    text = text + "Status: " + status + "\n"
-    text = text + "Srok: " + days_str + "\n"
-    text = text + "Polzovatel: " + user_str + "\n"
-    text = text + "Ostalos: " + exp_str + "\n\n"
+    text = "<b>Ключ #" + str(key_id) + "</b>\n\n"
+    text = text + "Ключ: <code>" + str(key) + "</code>\n"
+    text = text + "Статус: " + status + "\n"
+    text = text + "Срок: " + days_str + "\n"
+    text = text + "Пользователь: " + user_str + "\n"
+    text = text + "Осталось: " + exp_str + "\n\n"
 
     if not is_revoked:
-        text = text + "Udalit etot kluch?"
+        text = text + "Удалить этот ключ?"
         await safe_edit(cb.message, text, confirm_revoke_kb(key_id))
     else:
         await safe_edit(cb.message, text, back_admin_kb())
@@ -946,15 +938,15 @@ async def key_info(cb: types.CallbackQuery):
 @dp.callback_query(F.data.startswith("confirmrev_"))
 async def confirm_revoke(cb: types.CallbackQuery):
     if not is_admin(cb.from_user):
-        await cb.answer("Net dostupa", show_alert=True)
+        await cb.answer("Нет доступа", show_alert=True)
         return
 
     key_id = int(cb.data.replace("confirmrev_", ""))
 
     await revoke_key(key_id)
 
-    text = "<b>Kluch #" + str(key_id) + " annulirovan!</b>\n\n"
-    text = text + "Polzovatel poteryal dostup."
+    text = "<b>Ключ #" + str(key_id) + " аннулирован!</b>\n\n"
+    text = text + "Пользователь потерял доступ."
 
     await safe_edit(cb.message, text, back_admin_kb())
     await cb.answer()
@@ -963,20 +955,20 @@ async def confirm_revoke(cb: types.CallbackQuery):
 @dp.callback_query(F.data == "stats")
 async def stats_handler(cb: types.CallbackQuery):
     if not is_admin(cb.from_user):
-        await cb.answer("Net dostupa", show_alert=True)
+        await cb.answer("Нет доступа", show_alert=True)
         return
 
     active, total, free_keys, total_keys, total_stars = await get_stats()
 
-    text = "<b>Statistika</b>\n\n"
-    text = text + "<b>Polzovateli:</b>\n"
-    text = text + "Aktivnyh: " + str(active) + "\n"
-    text = text + "Vsego: " + str(total) + "\n\n"
-    text = text + "<b>Kluchi:</b>\n"
-    text = text + "Svobodnyh: " + str(free_keys) + "\n"
-    text = text + "Vsego: " + str(total_keys) + "\n\n"
-    text = text + "<b>Dohod:</b>\n"
-    text = text + "Vsego zvezd: " + str(total_stars)
+    text = "<b>Статистика</b>\n\n"
+    text = text + "<b>Пользователи:</b>\n"
+    text = text + "Активных: " + str(active) + "\n"
+    text = text + "Всего: " + str(total) + "\n\n"
+    text = text + "<b>Ключи:</b>\n"
+    text = text + "Свободных: " + str(free_keys) + "\n"
+    text = text + "Всего: " + str(total_keys) + "\n\n"
+    text = text + "<b>Доход:</b>\n"
+    text = text + "Всего звёзд: " + str(total_stars)
 
     await safe_edit(cb.message, text, back_admin_kb())
     await cb.answer()
@@ -985,17 +977,17 @@ async def stats_handler(cb: types.CallbackQuery):
 @dp.callback_query(F.data == "restart_xray")
 async def restart_xray_handler(cb: types.CallbackQuery):
     if not is_admin(cb.from_user):
-        await cb.answer("Net dostupa", show_alert=True)
+        await cb.answer("Нет доступа", show_alert=True)
         return
 
-    await cb.answer("Perezapusk...")
+    await cb.answer("Перезапуск...")
     await restart_xray()
 
-    await safe_edit(cb.message, "<b>Xray perezapuschen!</b>", back_admin_kb())
+    await safe_edit(cb.message, "<b>Xray перезапущен!</b>", back_admin_kb())
 
 
 async def run_bot():
-    print("Starting bot...")
+    print("Bot starting...")
     await dp.start_polling(bot)
 
 
@@ -1024,9 +1016,7 @@ async def expiry_checker():
 
 
 async def main():
-    print("=" * 40)
     print("NEFRIT VPN SERVER")
-    print("=" * 40)
 
     await init_db()
     print("DB OK")
