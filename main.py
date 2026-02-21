@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 from aiohttp import web, WSMsgType, ClientSession
 import aiosqlite
 from aiogram import Bot, Dispatcher, types, F
-from aiogram.filters import CommandStart
+from aiogram.filters import CommandStart, CommandObject
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.types import LabeledPrice, PreCheckoutQuery
 from aiogram.fsm.context import FSMContext
@@ -24,6 +24,7 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "mellfreezy")
 BASE_URL = os.getenv("BASE_URL", "https://nefritvpn.onrender.com")
+BOT_USERNAME = os.getenv("BOT_USERNAME", "nefrit_vpn_bot")
 PORT = int(os.getenv("PORT", 8080))
 XRAY_PORT = 10001
 
@@ -41,6 +42,10 @@ PRICES = {
     "year": {"days": 365, "stars": 100, "name": "1 год"},
     "forever": {"days": None, "stars": 300, "name": "Навсегда"}
 }
+
+TRIAL_DAYS = 3
+TRIAL_DAYS_REFERRAL = 5
+REFERRAL_BONUS_DAYS = 3
 
 xray_process = None
 bot = Bot(token=BOT_TOKEN)
@@ -65,7 +70,9 @@ async def init_db():
             "key_id INTEGER, "
             "created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, "
             "expires_at TIMESTAMP, "
-            "is_active BOOLEAN DEFAULT 1)"
+            "is_active BOOLEAN DEFAULT 1, "
+            "trial_used BOOLEAN DEFAULT 0, "
+            "referred_by INTEGER DEFAULT NULL)"
         )
         await db.execute(
             "CREATE TABLE IF NOT EXISTS keys ("
@@ -88,6 +95,14 @@ async def init_db():
             "amount INTEGER, "
             "plan TEXT, "
             "created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)"
+        )
+        await db.execute(
+            "CREATE TABLE IF NOT EXISTS referrals ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "referrer_id INTEGER, "
+            "referred_id INTEGER UNIQUE, "
+            "created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, "
+            "bonus_given BOOLEAN DEFAULT 0)"
         )
         await db.commit()
 
@@ -139,6 +154,148 @@ async def get_all_users():
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute("SELECT user_uuid, path FROM users WHERE is_active = 1")
         return await cursor.fetchall()
+
+
+async def check_trial_used(user_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT trial_used FROM users WHERE user_id = ?", (user_id,))
+        row = await cursor.fetchone()
+        if row:
+            return row[0] == 1
+        return False
+
+
+async def activate_trial(user_id, username, days):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT path, user_uuid, is_active, expires_at FROM users WHERE user_id = ?", (user_id,))
+        existing = await cursor.fetchone()
+        
+        now = datetime.now()
+        expires_at = (now + timedelta(days=days)).isoformat()
+        
+        if existing:
+            old_path = existing[0]
+            old_uuid = existing[1]
+            old_active = existing[2]
+            old_expires = existing[3]
+            
+            if old_active and old_expires:
+                try:
+                    old_exp = datetime.fromisoformat(old_expires)
+                    if old_exp > now:
+                        expires_at = (old_exp + timedelta(days=days)).isoformat()
+                except:
+                    pass
+            
+            await db.execute(
+                "UPDATE users SET expires_at = ?, is_active = 1, trial_used = 1 WHERE user_id = ?",
+                (expires_at, user_id)
+            )
+            await db.commit()
+            return old_path, old_uuid
+        else:
+            user_uuid = str(uuid.uuid4())
+            user_path = "u" + str(user_id)
+            
+            await db.execute(
+                "INSERT INTO users (user_id, username, user_uuid, path, created_at, expires_at, is_active, trial_used) VALUES (?, ?, ?, ?, ?, ?, 1, 1)",
+                (user_id, username, user_uuid, user_path, now.isoformat(), expires_at)
+            )
+            await db.commit()
+            await restart_xray()
+            return user_path, user_uuid
+
+
+async def add_days_to_user(user_id, days):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT expires_at, is_active FROM users WHERE user_id = ?", (user_id,))
+        row = await cursor.fetchone()
+        
+        if not row:
+            return False
+        
+        now = datetime.now()
+        old_expires = row[0]
+        
+        if old_expires:
+            try:
+                old_exp = datetime.fromisoformat(old_expires)
+                if old_exp > now:
+                    new_expires = (old_exp + timedelta(days=days)).isoformat()
+                else:
+                    new_expires = (now + timedelta(days=days)).isoformat()
+            except:
+                new_expires = (now + timedelta(days=days)).isoformat()
+        else:
+            return True
+        
+        await db.execute(
+            "UPDATE users SET expires_at = ?, is_active = 1 WHERE user_id = ?",
+            (new_expires, user_id)
+        )
+        await db.commit()
+        return True
+
+
+async def save_referral(referrer_id, referred_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        try:
+            await db.execute(
+                "INSERT INTO referrals (referrer_id, referred_id, created_at) VALUES (?, ?, ?)",
+                (referrer_id, referred_id, datetime.now().isoformat())
+            )
+            await db.execute(
+                "UPDATE users SET referred_by = ? WHERE user_id = ?",
+                (referrer_id, referred_id)
+            )
+            await db.commit()
+            return True
+        except:
+            return False
+
+
+async def give_referral_bonus(referrer_id, referred_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT bonus_given FROM referrals WHERE referrer_id = ? AND referred_id = ?",
+            (referrer_id, referred_id)
+        )
+        row = await cursor.fetchone()
+        
+        if row and row[0] == 0:
+            await add_days_to_user(referrer_id, REFERRAL_BONUS_DAYS)
+            await db.execute(
+                "UPDATE referrals SET bonus_given = 1 WHERE referrer_id = ? AND referred_id = ?",
+                (referrer_id, referred_id)
+            )
+            await db.commit()
+            return True
+        return False
+
+
+async def get_referral_stats(user_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT COUNT(*) FROM referrals WHERE referrer_id = ?",
+            (user_id,)
+        )
+        count = (await cursor.fetchone())[0]
+        
+        cursor = await db.execute(
+            "SELECT referred_by FROM users WHERE user_id = ?",
+            (user_id,)
+        )
+        row = await cursor.fetchone()
+        referred_by = row[0] if row else None
+        
+        return count, referred_by
+
+
+async def check_user_exists(user_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT id FROM users WHERE user_id = ?", (user_id,))
+        row = await cursor.fetchone()
+        return row is not None
 
 
 async def create_subscription(user_id, username, days=None):
@@ -260,7 +417,9 @@ async def get_stats():
         cursor = await db.execute("SELECT SUM(amount) FROM payments")
         row = await cursor.fetchone()
         total_stars = row[0] if row[0] else 0
-        return active, total, free_keys, total_keys, total_stars
+        cursor = await db.execute("SELECT COUNT(*) FROM referrals")
+        total_refs = (await cursor.fetchone())[0]
+        return active, total, free_keys, total_keys, total_stars, total_refs
 
 
 async def get_keys_list():
@@ -432,6 +591,7 @@ def main_kb(admin=False):
         [InlineKeyboardButton(text="Купить подписку", callback_data="buy")],
         [InlineKeyboardButton(text="Активировать ключ", callback_data="activate")],
         [InlineKeyboardButton(text="Моя подписка", callback_data="mysub")],
+        [InlineKeyboardButton(text="Реферальная система", callback_data="referral")],
         [
             InlineKeyboardButton(text="Поддержка", url="https://t.me/" + SUPPORT_USERNAME),
             InlineKeyboardButton(text="Канал", url="https://t.me/" + CHANNEL_USERNAME)
@@ -442,13 +602,29 @@ def main_kb(admin=False):
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
-def buy_kb():
+async def buy_kb(user_id):
+    trial_used = await check_trial_used(user_id)
+    
+    buttons = []
+    
+    if not trial_used:
+        buttons.append([InlineKeyboardButton(text="Пробный период (3 дня)", callback_data="trial")])
+    
+    buttons.append([InlineKeyboardButton(text="1 неделя - 5 звёзд", callback_data="pay_week")])
+    buttons.append([InlineKeyboardButton(text="1 месяц - 10 звёзд", callback_data="pay_month")])
+    buttons.append([InlineKeyboardButton(text="1 год - 100 звёзд", callback_data="pay_year")])
+    buttons.append([InlineKeyboardButton(text="Навсегда - 300 звёзд", callback_data="pay_forever")])
+    buttons.append([InlineKeyboardButton(text="Назад", callback_data="back")])
+    
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def trial_confirm_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="1 неделя - 5 звёзд", callback_data="pay_week")],
-        [InlineKeyboardButton(text="1 месяц - 10 звёзд", callback_data="pay_month")],
-        [InlineKeyboardButton(text="1 год - 100 звёзд", callback_data="pay_year")],
-        [InlineKeyboardButton(text="Навсегда - 300 звёзд", callback_data="pay_forever")],
-        [InlineKeyboardButton(text="Назад", callback_data="back")]
+        [
+            InlineKeyboardButton(text="Активировать", callback_data="trial_confirm"),
+            InlineKeyboardButton(text="Отмена", callback_data="buy")
+        ]
     ])
 
 
@@ -538,9 +714,60 @@ async def safe_send(message, text, reply_markup=None):
 
 
 @dp.message(CommandStart())
-async def cmd_start(msg: types.Message, state: FSMContext):
+async def cmd_start(msg: types.Message, command: CommandObject, state: FSMContext):
     await state.clear()
+    
+    user_id = msg.from_user.id
+    username = msg.from_user.username or msg.from_user.first_name
     name = msg.from_user.first_name
+    
+    referrer_id = None
+    if command.args and command.args.startswith("ref_"):
+        try:
+            referrer_id = int(command.args.replace("ref_", ""))
+            if referrer_id == user_id:
+                referrer_id = None
+        except:
+            referrer_id = None
+    
+    user_exists = await check_user_exists(user_id)
+    
+    if referrer_id and not user_exists:
+        await save_referral(referrer_id, user_id)
+        
+        trial_days = TRIAL_DAYS_REFERRAL
+        path, user_uuid = await activate_trial(user_id, username, trial_days)
+        
+        await give_referral_bonus(referrer_id, user_id)
+        
+        await restart_xray()
+        
+        link = generate_vless_link(user_uuid, path)
+        sub_url = BASE_URL + "/sub/" + path
+        
+        text = "<b>Добро пожаловать в Nefrit VPN!</b>\n\n"
+        text = text + "Вы пришли по реферальной ссылке!\n"
+        text = text + "Вам начислен пробный период на <b>" + str(trial_days) + " дней</b>!\n\n"
+        text = text + "<b>Ссылка подписки:</b>\n"
+        text = text + "<code>" + sub_url + "</code>\n\n"
+        text = text + "<b>Конфиг:</b>\n"
+        text = text + "<code>" + link + "</code>\n\n"
+        text = text + "<b>Приложения:</b>\n"
+        text = text + "Android: V2rayNG\n"
+        text = text + "iOS: Streisand / V2Box\n"
+        text = text + "Windows: V2rayN"
+        
+        await msg.answer(text, reply_markup=main_kb(is_admin(msg.from_user)), parse_mode="HTML")
+        
+        try:
+            bonus_text = "Пользователь " + str(username) + " присоединился по вашей реферальной ссылке!\n"
+            bonus_text = bonus_text + "Вам начислено +" + str(REFERRAL_BONUS_DAYS) + " дней к подписке!"
+            await bot.send_message(referrer_id, bonus_text)
+        except:
+            pass
+        
+        return
+    
     text = "<b>Nefrit VPN</b>\n\n"
     text = text + "Добро пожаловать, " + str(name) + "!\n\n"
     text = text + "Быстрый и надёжный VPN сервис.\n\n"
@@ -565,7 +792,85 @@ async def buy_menu(cb: types.CallbackQuery):
     text = text + "1 год - 100 звёзд\n"
     text = text + "Навсегда - 300 звёзд\n\n"
     text = text + "Оплата через Telegram Stars"
-    await safe_edit(cb.message, text, buy_kb())
+    
+    kb = await buy_kb(cb.from_user.id)
+    await safe_edit(cb.message, text, kb)
+    await cb.answer()
+
+
+@dp.callback_query(F.data == "trial")
+async def trial_menu(cb: types.CallbackQuery):
+    trial_used = await check_trial_used(cb.from_user.id)
+    
+    if trial_used:
+        await cb.answer("Вы уже использовали пробный период!", show_alert=True)
+        return
+    
+    text = "<b>Пробный период</b>\n\n"
+    text = text + "Активировать пробный период на <b>" + str(TRIAL_DAYS) + " дня</b>?\n\n"
+    text = text + "Пробный период можно использовать только один раз."
+    
+    await safe_edit(cb.message, text, trial_confirm_kb())
+    await cb.answer()
+
+
+@dp.callback_query(F.data == "trial_confirm")
+async def trial_confirm(cb: types.CallbackQuery):
+    user_id = cb.from_user.id
+    username = cb.from_user.username or cb.from_user.first_name
+    
+    trial_used = await check_trial_used(user_id)
+    
+    if trial_used:
+        await cb.answer("Вы уже использовали пробный период!", show_alert=True)
+        return
+    
+    path, user_uuid = await activate_trial(user_id, username, TRIAL_DAYS)
+    
+    await restart_xray()
+    
+    link = generate_vless_link(user_uuid, path)
+    sub_url = BASE_URL + "/sub/" + path
+    
+    exp = datetime.now() + timedelta(days=TRIAL_DAYS)
+    exp_str = exp.strftime("%d.%m.%Y %H:%M")
+    
+    text = "<b>Пробная подписка активирована!</b>\n\n"
+    text = text + "Действует до: " + exp_str + "\n\n"
+    text = text + "<b>Ссылка подписки:</b>\n"
+    text = text + "<code>" + sub_url + "</code>\n\n"
+    text = text + "<b>Конфиг:</b>\n"
+    text = text + "<code>" + link + "</code>\n\n"
+    text = text + "<b>Приложения:</b>\n"
+    text = text + "Android: V2rayNG\n"
+    text = text + "iOS: Streisand / V2Box\n"
+    text = text + "Windows: V2rayN"
+    
+    await safe_edit(cb.message, text, back_kb())
+    await cb.answer()
+
+
+@dp.callback_query(F.data == "referral")
+async def referral_menu(cb: types.CallbackQuery):
+    user_id = cb.from_user.id
+    
+    count, referred_by = await get_referral_stats(user_id)
+    
+    ref_link = "https://t.me/" + BOT_USERNAME + "?start=ref_" + str(user_id)
+    
+    text = "<b>Реферальная система</b>\n\n"
+    text = text + "Приглашайте друзей и получайте бонусы!\n\n"
+    text = text + "За каждого приглашённого друга вы получите <b>+" + str(REFERRAL_BONUS_DAYS) + " дня</b> к подписке.\n"
+    text = text + "Ваш друг получит <b>" + str(TRIAL_DAYS_REFERRAL) + " дней</b> пробного периода!\n\n"
+    text = text + "Приглашено людей: <b>" + str(count) + "</b>\n"
+    
+    if referred_by:
+        text = text + "Вас пригласил: <b>" + str(referred_by) + "</b>\n"
+    
+    text = text + "\n<b>Ваша реферальная ссылка:</b>\n"
+    text = text + "<code>" + ref_link + "</code>"
+    
+    await safe_edit(cb.message, text, back_kb())
     await cb.answer()
 
 
@@ -748,7 +1053,7 @@ async def admin_panel(cb: types.CallbackQuery, state: FSMContext):
         return
 
     await state.clear()
-    active, total, free_keys, total_keys, total_stars = await get_stats()
+    active, total, free_keys, total_keys, total_stars, total_refs = await get_stats()
 
     xray_ok = xray_process is not None and xray_process.poll() is None
     xray_status = "Работает" if xray_ok else "Остановлен"
@@ -757,6 +1062,7 @@ async def admin_panel(cb: types.CallbackQuery, state: FSMContext):
     text = text + "Пользователей: " + str(active) + " / " + str(total) + "\n"
     text = text + "Ключей: " + str(free_keys) + " / " + str(total_keys) + "\n"
     text = text + "Заработано звёзд: " + str(total_stars) + "\n"
+    text = text + "Рефералов: " + str(total_refs) + "\n"
     text = text + "Xray: " + xray_status
 
     await safe_edit(cb.message, text, admin_kb())
@@ -958,7 +1264,7 @@ async def stats_handler(cb: types.CallbackQuery):
         await cb.answer("Нет доступа", show_alert=True)
         return
 
-    active, total, free_keys, total_keys, total_stars = await get_stats()
+    active, total, free_keys, total_keys, total_stars, total_refs = await get_stats()
 
     text = "<b>Статистика</b>\n\n"
     text = text + "<b>Пользователи:</b>\n"
@@ -968,7 +1274,9 @@ async def stats_handler(cb: types.CallbackQuery):
     text = text + "Свободных: " + str(free_keys) + "\n"
     text = text + "Всего: " + str(total_keys) + "\n\n"
     text = text + "<b>Доход:</b>\n"
-    text = text + "Всего звёзд: " + str(total_stars)
+    text = text + "Всего звёзд: " + str(total_stars) + "\n\n"
+    text = text + "<b>Рефералы:</b>\n"
+    text = text + "Всего приглашений: " + str(total_refs)
 
     await safe_edit(cb.message, text, back_admin_kb())
     await cb.answer()
