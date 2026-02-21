@@ -37,10 +37,10 @@ SUPPORT_USERNAME = "mellfreezy"
 CHANNEL_USERNAME = "nefrit_vpn"
 
 PRICES = {
-    "week": {"days": 7, "stars": 5, "name": "1 неделя"},
-    "month": {"days": 30, "stars": 10, "name": "1 месяц"},
-    "year": {"days": 365, "stars": 100, "name": "1 год"},
-    "forever": {"days": None, "stars": 300, "name": "Навсегда"}
+    "week": {"days": 7, "stars": 25, "name": "1 неделя"},
+    "month": {"days": 30, "stars": 80, "name": "1 месяц"},
+    "year": {"days": 365, "stars": 500, "name": "1 год"},
+    "forever": {"days": None, "stars": 850, "name": "Навсегда"}
 }
 
 TRIAL_DAYS = 3
