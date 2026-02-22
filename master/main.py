@@ -40,26 +40,26 @@ CHANNEL_USERNAME = "nefrit_vpn"
 SERVERS = [
     {
         "id": 1,
-        "name": "Oregon",
+        "name": "Орегон",
         "url": BASE_URL,
         "emoji": "🇺🇸",
-        "location": "Oregon, USA",
+        "location": "Орегон, США",
         "is_master": True
     },
     {
         "id": 2,
-        "name": "Ohio",
+        "name": "Огайо",
         "url": "https://nefrit-ohio.onrender.com",
         "emoji": "🇺🇸",
-        "location": "Ohio, USA",
+        "location": "Огайо, США",
         "is_master": False
     },
     {
         "id": 3,
-        "name": "Frankfurt",
+        "name": "Франкфурт",
         "url": "https://nefrit-frankfurt.onrender.com",
         "emoji": "🇪🇺",
-        "location": "Frankfurt, Germany",
+        "location": "Франкфурт, Германия",
         "is_master": False
     }
 ]
