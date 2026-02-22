@@ -62,6 +62,14 @@ SERVERS = [
         "location": "Франкфурт, Германия",
         "is_master": False
     }
+    {
+        "id": 4,
+        "name": "Сингапур",
+        "url": "https://nefrit-singapure.onrender.com",
+        "emoji": "🇸🇬",
+        "location": "Сингапур, Азия",
+        "is_master": False
+}
 ]
 
 PRICES = {
