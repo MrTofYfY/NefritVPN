@@ -76,11 +76,11 @@ PRICES = {
     "week": {"days": 7, "stars": 5, "name": "1 неделя"},
     "month": {"days": 30, "stars": 10, "name": "1 месяц"},
     "year": {"days": 365, "stars": 100, "name": "1 год"},
-    "forever": {"days": None, "stars": 300, "name": "Навсегда"}
+    "forever": {"days": None, "stars": 150, "name": "Навсегда"}
 }
 
 TRIAL_DAYS = 3
-TRIAL_DAYS_REFERRAL = 5
+TRIAL_DAYS_REFERRAL = 3
 REFERRAL_BONUS_DAYS = 3
 
 xray_process = None
