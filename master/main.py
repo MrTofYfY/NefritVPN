@@ -23,7 +23,7 @@ load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "mellfreezy")
-BASE_URL = os.getenv("BASE_URL", "https://nefritvpn.onrender.com")
+BASE_URL = os.getenv("BASE_URL", "https://nefrit-master.onrender.com")
 BOT_USERNAME = os.getenv("BOT_USERNAME", "nefrit_vpn_bot")
 SERVER_SECRET = os.getenv("SERVER_SECRET", "default-secret")
 PORT = int(os.getenv("PORT", 8080))
@@ -49,7 +49,7 @@ SERVERS = [
     {
         "id": 2,
         "name": "Ohio",
-        "url": "https://nefritvpn-ohio.onrender.com",
+        "url": "https://nefrit-ohio.onrender.com",
         "emoji": "🇺🇸",
         "location": "Ohio, USA",
         "is_master": False
@@ -57,7 +57,7 @@ SERVERS = [
     {
         "id": 3,
         "name": "Frankfurt",
-        "url": "https://nefritvpn-frankfurt.onrender.com",
+        "url": "https://nefrit-frankfurt.onrender.com",
         "emoji": "🇪🇺",
         "location": "Frankfurt, Germany",
         "is_master": False
