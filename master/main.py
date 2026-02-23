@@ -58,7 +58,7 @@ SERVERS = [
         "id": 3,
         "name": "Франкфурт",
         "url": "https://nefrit-frankfurt.onrender.com",
-        "emoji": "🇪🇺",
+        "emoji": "🇩🇪",
         "location": "Франкфурт, Германия",
         "is_master": False
     },
@@ -69,7 +69,15 @@ SERVERS = [
         "emoji": "🇸🇬",
         "location": "Сингапур, Азия",
         "is_master": False
-}
+},
+        {
+        "id": 5,
+        "name": "Нурмберг",
+        "url": "https://nefrit-nurmberg.sliplane.app/",
+        "emoji": "🇩🇪",
+        "location": "Нурмберг, Германия",
+        "is_master": False
+        }
 ]
 
 PRICES = {
