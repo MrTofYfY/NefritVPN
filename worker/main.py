@@ -43,8 +43,6 @@ def generate_xray_config():
     
     with open(XRAY_CONFIG_PATH, "w") as f:
         json.dump(config, f, indent=2)
-    
-    print("Xray config updated: " + str(len(clients)) + " clients")
 
 
 def start_xray():
@@ -55,13 +53,10 @@ def start_xray():
     try:
         xray_process = subprocess.Popen(
             ["/usr/local/bin/xray", "run", "-config", str(XRAY_CONFIG_PATH)],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE
         )
-        print("Xray started PID: " + str(xray_process.pid))
         return True
-    except Exception as e:
-        print("Xray error: " + str(e))
+    except:
         return False
 
 
@@ -80,24 +75,16 @@ def restart_xray():
 
 
 async def handle_index(request):
-    text = SERVER_NAME + " - Active users: " + str(len(active_users))
-    return web.Response(text=text, content_type="text/html")
+    return web.Response(text=f"{SERVER_NAME} - Active users: {len(active_users)}", content_type="text/html")
 
 
 async def handle_health(request):
     xray_ok = xray_process is not None and xray_process.poll() is None
-    data = {
-        "status": "ok",
-        "server": SERVER_NAME,
-        "users": len(active_users),
-        "xray": xray_ok
-    }
-    return web.json_response(data)
+    return web.json_response({"status": "ok", "server": SERVER_NAME, "users": len(active_users), "xray": xray_ok})
 
 
 async def handle_add_user(request):
     data = await request.json()
-    
     if data.get("secret") != SERVER_SECRET:
         return web.json_response({"error": "Unauthorized"}, status=401)
     
@@ -107,43 +94,23 @@ async def handle_add_user(request):
     if not user_uuid or not user_path:
         return web.json_response({"error": "Missing data"}, status=400)
     
-    active_users[user_uuid] = {
-        "path": user_path,
-        "added_at": datetime.now().isoformat()
-    }
-    
-    print("User added: " + user_path + " (" + user_uuid + ")")
-    
+    active_users[user_uuid] = {"path": user_path, "added_at": datetime.now().isoformat()}
     restart_xray()
     
-    return web.json_response({
-        "success": True,
-        "message": "User " + user_path + " added",
-        "total_users": len(active_users)
-    })
+    return web.json_response({"success": True, "total_users": len(active_users)})
 
 
 async def handle_remove_user(request):
     data = await request.json()
-    
     if data.get("secret") != SERVER_SECRET:
         return web.json_response({"error": "Unauthorized"}, status=401)
     
     user_uuid = data.get("uuid")
     
     if user_uuid in active_users:
-        user_path = active_users[user_uuid]["path"]
         del active_users[user_uuid]
-        
-        print("User removed: " + user_path + " (" + user_uuid + ")")
-        
         restart_xray()
-        
-        return web.json_response({
-            "success": True,
-            "message": "User removed",
-            "total_users": len(active_users)
-        })
+        return web.json_response({"success": True, "total_users": len(active_users)})
     
     return web.json_response({"error": "User not found"}, status=404)
 
@@ -156,10 +123,8 @@ async def handle_tunnel(request):
     await ws_client.prepare(request)
     
     try:
-        url = "http://127.0.0.1:" + str(XRAY_PORT) + "/tunnel"
         async with ClientSession() as session:
-            async with session.ws_connect(url, timeout=30) as ws_xray:
-                
+            async with session.ws_connect(f"http://127.0.0.1:{XRAY_PORT}/tunnel", timeout=30) as ws_xray:
                 async def fwd(src, dst):
                     try:
                         async for msg in src:
@@ -172,11 +137,7 @@ async def handle_tunnel(request):
                     except:
                         pass
                 
-                await asyncio.gather(
-                    fwd(ws_client, ws_xray),
-                    fwd(ws_xray, ws_client),
-                    return_exceptions=True
-                )
+                await asyncio.gather(fwd(ws_client, ws_xray), fwd(ws_xray, ws_client), return_exceptions=True)
     except:
         pass
     finally:
@@ -198,26 +159,17 @@ async def run_web():
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
-    print(SERVER_NAME + " on port " + str(PORT))
+    print(f"{SERVER_NAME} on port {PORT}")
     
     while True:
         await asyncio.sleep(3600)
 
 
 async def main():
-    print("=" * 50)
-    print("NEFRIT VPN WORKER: " + SERVER_NAME)
-    print("=" * 50)
-    
+    print(f"NEFRIT VPN WORKER: {SERVER_NAME}")
     generate_xray_config()
     start_xray()
     await asyncio.sleep(3)
-    
-    if xray_process and xray_process.poll() is None:
-        print("Xray is running")
-    else:
-        print("Warning: Xray may not be running")
-    
     await run_web()
 
 
