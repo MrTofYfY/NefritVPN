@@ -101,7 +101,7 @@ def generate_path():
 
 def get_turso_http_url():
     url = TURSO_URL.replace("libsql://", "https://")
-    return url
+    return url + "/v2/pipeline"
 
 
 def db_execute(sql, params=None):
@@ -112,18 +112,41 @@ def db_execute(sql, params=None):
     }
     
     if params:
-        stmt = {"q": sql, "params": list(params)}
+        args = []
+        for p in params:
+            if p is None:
+                args.append({"type": "null"})
+            elif isinstance(p, int):
+                args.append({"type": "integer", "value": str(p)})
+            elif isinstance(p, float):
+                args.append({"type": "float", "value": p})
+            else:
+                args.append({"type": "text", "value": str(p)})
+        stmt = {
+            "type": "execute",
+            "stmt": {
+                "sql": sql,
+                "args": args
+            }
+        }
     else:
-        stmt = {"q": sql}
+        stmt = {
+            "type": "execute",
+            "stmt": {"sql": sql}
+        }
     
-    body = {"statements": [stmt]}
+    body = {"requests": [stmt, {"type": "close"}]}
     
-    with httpx.Client(timeout=30) as client:
-        resp = client.post(url, json=body, headers=headers)
-        if resp.status_code != 200:
-            print(f"DB Error: {resp.status_code} {resp.text}")
-            return None
-        return resp.json()
+    try:
+        with httpx.Client(timeout=30) as client:
+            resp = client.post(url, json=body, headers=headers)
+            if resp.status_code != 200:
+                print(f"DB Error: {resp.status_code} {resp.text}")
+                return None
+            return resp.json()
+    except Exception as e:
+        print(f"DB Exception: {e}")
+        return None
 
 
 def db_query(sql, params=None):
@@ -131,9 +154,23 @@ def db_query(sql, params=None):
     if not result:
         return []
     try:
-        rows = result[0]["results"]["rows"]
+        rows_data = result["results"][0]["response"]["result"]["rows"]
+        rows = []
+        for row in rows_data:
+            parsed_row = []
+            for cell in row:
+                if cell["type"] == "null":
+                    parsed_row.append(None)
+                elif cell["type"] == "integer":
+                    parsed_row.append(int(cell["value"]))
+                elif cell["type"] == "float":
+                    parsed_row.append(float(cell["value"]))
+                else:
+                    parsed_row.append(cell["value"])
+            rows.append(parsed_row)
         return rows
-    except (KeyError, IndexError):
+    except (KeyError, IndexError, TypeError) as e:
+        print(f"DB Parse Error: {e}")
         return []
 
 
@@ -145,7 +182,7 @@ def db_query_one(sql, params=None):
 def init_db():
     db_execute(
         "CREATE TABLE IF NOT EXISTS users ("
-        "id INTEGER PRIMARY KEY, "
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, "
         "user_id INTEGER UNIQUE, "
         "username TEXT, "
         "user_uuid TEXT UNIQUE, "
@@ -242,7 +279,7 @@ def create_key(days=None):
     key = "NEFRIT-" + secrets.token_hex(8).upper()
     now = datetime.now().isoformat()
     db_execute(
-        "INSERT INTO keys (key, days, created_at) VALUES (?, ?, ?)",
+        "INSERT INTO keys (key, days, created_at, is_used, is_revoked) VALUES (?, ?, ?, 0, 0)",
         (key, days, now)
     )
     row = db_query_one("SELECT id FROM keys WHERE key = ?", (key,))
@@ -252,7 +289,7 @@ def create_key(days=None):
 
 def check_trial_used(user_id):
     row = db_query_one(
-        "SELECT 1 FROM trial_used WHERE user_id = ?", (user_id,)
+        "SELECT user_id FROM trial_used WHERE user_id = ?", (user_id,)
     )
     return row is not None
 
@@ -290,8 +327,8 @@ def add_days_to_user(user_id, days):
 def save_referral(referrer_id, referred_id):
     try:
         db_execute(
-            "INSERT INTO referrals (referrer_id, referred_id, created_at) "
-            "VALUES (?, ?, ?)",
+            "INSERT INTO referrals (referrer_id, referred_id, created_at, bonus_given) "
+            "VALUES (?, ?, ?, 0)",
             (referrer_id, referred_id, datetime.now().isoformat())
         )
         return True
@@ -380,8 +417,7 @@ async def create_subscription(user_id, username, days=None):
         "INSERT INTO users (user_id, username, user_uuid, path, "
         "created_at, expires_at, is_active) "
         "VALUES (?, ?, ?, ?, ?, ?, 1)",
-        (user_id, username, user_uuid, user_path,
-         now.isoformat(), expires_at)
+        (user_id, username, user_uuid, user_path, now.isoformat(), expires_at)
     )
     await sync_user_to_servers(user_uuid, user_path, "add")
     await restart_xray()
