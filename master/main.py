@@ -5,10 +5,10 @@ import base64
 import asyncio
 import secrets
 import subprocess
-import httpx
 from pathlib import Path
 from datetime import datetime, timedelta
 from aiohttp import web, WSMsgType, ClientSession
+import aiosqlite
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart, CommandObject
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
@@ -29,11 +29,9 @@ SERVER_SECRET = os.getenv("SERVER_SECRET", "default-secret")
 PORT = int(os.getenv("PORT", 8080))
 XRAY_PORT = 10001
 
-TURSO_URL = os.getenv("TURSO_URL")
-TURSO_TOKEN = os.getenv("TURSO_TOKEN")
-
 DATA_DIR = Path("data")
 DATA_DIR.mkdir(exist_ok=True)
+DB_PATH = DATA_DIR / "vpn.db"
 XRAY_CONFIG_PATH = DATA_DIR / "xray_config.json"
 
 SUPPORT_USERNAME = "mellfreezy"
@@ -99,92 +97,56 @@ def generate_path():
     return secrets.token_urlsafe(12)
 
 
-def get_turso_url():
-    return TURSO_URL.replace("libsql://", "https://")
-
-
-def db_request(statements):
-    url = get_turso_url()
-    headers = {
-        "Authorization": f"Bearer {TURSO_TOKEN}",
-        "Content-Type": "application/json"
-    }
-    
-    body = {"statements": statements}
-    
-    try:
-        with httpx.Client(timeout=30) as client:
-            resp = client.post(url, json=body, headers=headers)
-            if resp.status_code != 200:
-                print(f"DB Error [{resp.status_code}]: {resp.text}")
-                return None
-            return resp.json()
-    except Exception as e:
-        print(f"DB Exception: {e}")
-        return None
-
-
-def db_execute(sql, params=None):
-    if params:
-        stmt = {"q": sql, "params": [{"value": p, "type": "null" if p is None else ("integer" if isinstance(p, int) else "text")} if isinstance(p, (int, type(None))) else {"value": str(p), "type": "text"} for p in params]}
-    else:
-        stmt = sql
-    
-    return db_request([stmt])
-
-
-def db_execute_simple(sql, params=None):
-    if params:
-        param_list = []
-        for p in params:
-            if p is None:
-                param_list.append(None)
-            else:
-                param_list.append(p)
-        stmt = [sql] + param_list
-    else:
-        stmt = sql
-    
-    return db_request([stmt])
-
-
-def db_query(sql, params=None):
-    result = db_execute_simple(sql, params)
-    if not result:
-        return []
-    try:
-        if isinstance(result, list) and len(result) > 0:
-            first = result[0]
-            if "results" in first:
-                rows = first["results"].get("rows", [])
-                return rows
-            elif "rows" in first:
-                return first["rows"]
-            elif isinstance(first, dict) and "columns" in first:
-                return first.get("rows", [])
-        return []
-    except Exception as e:
-        print(f"DB Query Parse Error: {e}, result: {result}")
-        return []
-
-
-def db_query_one(sql, params=None):
-    rows = db_query(sql, params)
-    if rows and len(rows) > 0:
-        return rows[0]
-    return None
-
-
-def init_db():
-    statements = [
-        "CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER UNIQUE, username TEXT, user_uuid TEXT UNIQUE, path TEXT UNIQUE, key_id INTEGER, created_at TEXT, expires_at TEXT, is_active INTEGER DEFAULT 1, referred_by INTEGER DEFAULT NULL)",
-        "CREATE TABLE IF NOT EXISTS trial_used (user_id INTEGER PRIMARY KEY)",
-        "CREATE TABLE IF NOT EXISTS keys (id INTEGER PRIMARY KEY AUTOINCREMENT, key TEXT UNIQUE, days INTEGER, is_used INTEGER DEFAULT 0, used_by INTEGER, used_by_username TEXT, created_at TEXT, activated_at TEXT, expires_at TEXT, is_revoked INTEGER DEFAULT 0)",
-        "CREATE TABLE IF NOT EXISTS payments (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, username TEXT, amount INTEGER, plan TEXT, created_at TEXT)",
-        "CREATE TABLE IF NOT EXISTS referrals (id INTEGER PRIMARY KEY AUTOINCREMENT, referrer_id INTEGER, referred_id INTEGER UNIQUE, created_at TEXT, bonus_given INTEGER DEFAULT 0)"
-    ]
-    result = db_request(statements)
-    print(f"Database initialized: {result is not None}")
+async def init_db():
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "CREATE TABLE IF NOT EXISTS users ("
+            "id INTEGER PRIMARY KEY, "
+            "user_id INTEGER UNIQUE, "
+            "username TEXT, "
+            "user_uuid TEXT UNIQUE, "
+            "path TEXT UNIQUE, "
+            "key_id INTEGER, "
+            "created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, "
+            "expires_at TIMESTAMP, "
+            "is_active BOOLEAN DEFAULT 1, "
+            "referred_by INTEGER DEFAULT NULL)"
+        )
+        await db.execute(
+            "CREATE TABLE IF NOT EXISTS trial_used ("
+            "user_id INTEGER PRIMARY KEY)"
+        )
+        await db.execute(
+            "CREATE TABLE IF NOT EXISTS keys ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "key TEXT UNIQUE, "
+            "days INTEGER, "
+            "is_used BOOLEAN DEFAULT 0, "
+            "used_by INTEGER, "
+            "used_by_username TEXT, "
+            "created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, "
+            "activated_at TIMESTAMP, "
+            "expires_at TIMESTAMP, "
+            "is_revoked BOOLEAN DEFAULT 0)"
+        )
+        await db.execute(
+            "CREATE TABLE IF NOT EXISTS payments ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "user_id INTEGER, "
+            "username TEXT, "
+            "amount INTEGER, "
+            "plan TEXT, "
+            "created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)"
+        )
+        await db.execute(
+            "CREATE TABLE IF NOT EXISTS referrals ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "referrer_id INTEGER, "
+            "referred_id INTEGER UNIQUE, "
+            "created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, "
+            "bonus_given BOOLEAN DEFAULT 0)"
+        )
+        await db.commit()
 
 
 async def sync_user_to_servers(user_uuid, user_path, action="add"):
@@ -232,400 +194,333 @@ def generate_subscription_multi(user_uuid, user_path):
     return base64.b64encode(all_configs.encode()).decode()
 
 
-def create_key(days=None):
+async def create_key(days=None):
     key = "NEFRIT-" + secrets.token_hex(8).upper()
     now = datetime.now().isoformat()
-    
-    if days is None:
-        sql = f"INSERT INTO keys (key, days, created_at, is_used, is_revoked) VALUES ('{key}', NULL, '{now}', 0, 0)"
-    else:
-        sql = f"INSERT INTO keys (key, days, created_at, is_used, is_revoked) VALUES ('{key}', {days}, '{now}', 0, 0)"
-    
-    db_request([sql])
-    
-    result = db_request([f"SELECT id FROM keys WHERE key = '{key}'"])
-    key_id = 0
-    if result and len(result) > 0:
-        try:
-            rows = result[0].get("results", {}).get("rows", [])
-            if rows:
-                key_id = rows[0][0]
-        except:
-            pass
-    
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO keys (key, days, created_at) VALUES (?, ?, ?)",
+            (key, days, now)
+        )
+        await db.commit()
+        cursor = await db.execute("SELECT id FROM keys WHERE key = ?", (key,))
+        row = await cursor.fetchone()
+        key_id = row[0] if row else 0
     return key, key_id
 
 
-def check_trial_used(user_id):
-    result = db_request([f"SELECT user_id FROM trial_used WHERE user_id = {user_id}"])
-    if result and len(result) > 0:
-        try:
-            rows = result[0].get("results", {}).get("rows", [])
-            return len(rows) > 0
-        except:
-            pass
-    return False
+async def check_trial_used(user_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT 1 FROM trial_used WHERE user_id = ?", (user_id,)
+        )
+        return (await cursor.fetchone()) is not None
 
 
 async def activate_trial(user_id, username, days):
-    db_request([f"INSERT OR IGNORE INTO trial_used (user_id) VALUES ({user_id})"])
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT OR IGNORE INTO trial_used (user_id) VALUES (?)", (user_id,)
+        )
+        await db.commit()
     return await create_subscription(user_id, username, days)
 
 
-def add_days_to_user(user_id, days):
-    result = db_request([f"SELECT expires_at FROM users WHERE user_id = {user_id}"])
-    if not result:
-        return False
-    
-    try:
-        rows = result[0].get("results", {}).get("rows", [])
-        if not rows:
+async def add_days_to_user(user_id, days):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT expires_at FROM users WHERE user_id = ?", (user_id,)
+        )
+        row = await cursor.fetchone()
+        if not row:
             return False
-        old_expires = rows[0][0]
-    except:
-        return False
-    
-    now = datetime.now()
-    if old_expires is None:
+        now = datetime.now()
+        old_expires = row[0]
+        if old_expires is None:
+            return True
+        try:
+            old_exp = datetime.fromisoformat(old_expires)
+            base = old_exp if old_exp > now else now
+            new_expires = (base + timedelta(days=days)).isoformat()
+        except:
+            new_expires = (now + timedelta(days=days)).isoformat()
+        await db.execute(
+            "UPDATE users SET expires_at = ?, is_active = 1 WHERE user_id = ?",
+            (new_expires, user_id)
+        )
+        await db.commit()
         return True
-    try:
-        old_exp = datetime.fromisoformat(old_expires)
-        base = old_exp if old_exp > now else now
-        new_expires = (base + timedelta(days=days)).isoformat()
-    except:
-        new_expires = (now + timedelta(days=days)).isoformat()
-    
-    db_request([f"UPDATE users SET expires_at = '{new_expires}', is_active = 1 WHERE user_id = {user_id}"])
-    return True
 
 
-def save_referral(referrer_id, referred_id):
-    try:
-        now = datetime.now().isoformat()
-        db_request([f"INSERT INTO referrals (referrer_id, referred_id, created_at, bonus_given) VALUES ({referrer_id}, {referred_id}, '{now}', 0)"])
-        return True
-    except:
+async def save_referral(referrer_id, referred_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        try:
+            await db.execute(
+                "INSERT INTO referrals (referrer_id, referred_id, created_at) "
+                "VALUES (?, ?, ?)",
+                (referrer_id, referred_id, datetime.now().isoformat())
+            )
+            await db.commit()
+            return True
+        except:
+            return False
+
+
+async def give_referral_bonus(referrer_id, referred_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT bonus_given FROM referrals "
+            "WHERE referrer_id = ? AND referred_id = ?",
+            (referrer_id, referred_id)
+        )
+        row = await cursor.fetchone()
+        if row and row[0] == 0:
+            await add_days_to_user(referrer_id, REFERRAL_BONUS_DAYS)
+            await db.execute(
+                "UPDATE referrals SET bonus_given = 1 "
+                "WHERE referrer_id = ? AND referred_id = ?",
+                (referrer_id, referred_id)
+            )
+            await db.commit()
+            return True
         return False
 
 
-def give_referral_bonus(referrer_id, referred_id):
-    result = db_request([f"SELECT bonus_given FROM referrals WHERE referrer_id = {referrer_id} AND referred_id = {referred_id}"])
-    if result:
-        try:
-            rows = result[0].get("results", {}).get("rows", [])
-            if rows and rows[0][0] == 0:
-                add_days_to_user(referrer_id, REFERRAL_BONUS_DAYS)
-                db_request([f"UPDATE referrals SET bonus_given = 1 WHERE referrer_id = {referrer_id} AND referred_id = {referred_id}"])
-                return True
-        except:
-            pass
-    return False
+async def get_referral_stats(user_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT COUNT(*) FROM referrals WHERE referrer_id = ?", (user_id,)
+        )
+        count = (await cursor.fetchone())[0]
+        cursor = await db.execute(
+            "SELECT referrer_id FROM referrals WHERE referred_id = ?", (user_id,)
+        )
+        row = await cursor.fetchone()
+        referred_by = row[0] if row else None
+        return count, referred_by
 
 
-def get_referral_stats(user_id):
-    count = 0
-    referred_by = None
-    
-    result = db_request([f"SELECT COUNT(*) FROM referrals WHERE referrer_id = {user_id}"])
-    if result:
-        try:
-            rows = result[0].get("results", {}).get("rows", [])
-            if rows:
-                count = rows[0][0]
-        except:
-            pass
-    
-    result = db_request([f"SELECT referrer_id FROM referrals WHERE referred_id = {user_id}"])
-    if result:
-        try:
-            rows = result[0].get("results", {}).get("rows", [])
-            if rows:
-                referred_by = rows[0][0]
-        except:
-            pass
-    
-    return count, referred_by
-
-
-def check_user_exists(user_id):
-    result = db_request([f"SELECT id FROM users WHERE user_id = {user_id}"])
-    if result:
-        try:
-            rows = result[0].get("results", {}).get("rows", [])
-            return len(rows) > 0
-        except:
-            pass
-    return False
+async def check_user_exists(user_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT id FROM users WHERE user_id = ?", (user_id,)
+        )
+        return (await cursor.fetchone()) is not None
 
 
 async def create_subscription(user_id, username, days=None):
-    result = db_request([f"SELECT path, user_uuid, expires_at FROM users WHERE user_id = {user_id}"])
-    existing = None
-    if result:
-        try:
-            rows = result[0].get("results", {}).get("rows", [])
-            if rows:
-                existing = rows[0]
-        except:
-            pass
-    
-    now = datetime.now()
-    
-    if existing:
-        old_path, old_uuid, old_expires = existing
-        
-        is_expired = False
-        if old_expires:
-            try:
-                is_expired = datetime.fromisoformat(old_expires) <= now
-            except:
-                pass
-        
-        if not is_expired:
-            if old_expires is None:
-                new_expires = None
-            elif days is None:
-                new_expires = None
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT path, user_uuid, expires_at FROM users WHERE user_id = ?",
+            (user_id,)
+        )
+        existing = await cursor.fetchone()
+        now = datetime.now()
+
+        if existing:
+            old_path, old_uuid, old_expires = existing
+
+            is_expired = False
+            if old_expires:
+                try:
+                    is_expired = datetime.fromisoformat(old_expires) <= now
+                except:
+                    pass
+
+            if not is_expired:
+                if old_expires is None:
+                    new_expires = None
+                elif days is None:
+                    new_expires = None
+                else:
+                    old_exp = datetime.fromisoformat(old_expires)
+                    new_expires = (old_exp + timedelta(days=days)).isoformat()
+                await db.execute(
+                    "UPDATE users SET expires_at = ?, is_active = 1 "
+                    "WHERE user_id = ?",
+                    (new_expires, user_id)
+                )
+                await db.commit()
+                await sync_user_to_servers(old_uuid, old_path, "add")
+                return old_path, old_uuid
             else:
-                old_exp = datetime.fromisoformat(old_expires)
-                new_expires = (old_exp + timedelta(days=days)).isoformat()
-            
-            if new_expires:
-                db_request([f"UPDATE users SET expires_at = '{new_expires}', is_active = 1 WHERE user_id = {user_id}"])
-            else:
-                db_request([f"UPDATE users SET expires_at = NULL, is_active = 1 WHERE user_id = {user_id}"])
-            
-            await sync_user_to_servers(old_uuid, old_path, "add")
-            return old_path, old_uuid
-        else:
-            db_request([f"DELETE FROM users WHERE user_id = {user_id}"])
-            await sync_user_to_servers(old_uuid, old_path, "remove")
-    
-    user_uuid = str(uuid.uuid4())
-    user_path = generate_path()
-    expires_at = (now + timedelta(days=days)).isoformat() if days else None
-    created_at = now.isoformat()
-    
-    username_safe = username.replace("'", "''") if username else ""
-    
-    if expires_at:
-        sql = f"INSERT INTO users (user_id, username, user_uuid, path, created_at, expires_at, is_active) VALUES ({user_id}, '{username_safe}', '{user_uuid}', '{user_path}', '{created_at}', '{expires_at}', 1)"
-    else:
-        sql = f"INSERT INTO users (user_id, username, user_uuid, path, created_at, expires_at, is_active) VALUES ({user_id}, '{username_safe}', '{user_uuid}', '{user_path}', '{created_at}', NULL, 1)"
-    
-    db_request([sql])
-    await sync_user_to_servers(user_uuid, user_path, "add")
-    await restart_xray()
-    return user_path, user_uuid
+                await db.execute(
+                    "DELETE FROM users WHERE user_id = ?", (user_id,)
+                )
+                await db.commit()
+                await sync_user_to_servers(old_uuid, old_path, "remove")
+
+        user_uuid = str(uuid.uuid4())
+        user_path = generate_path()
+        expires_at = (now + timedelta(days=days)).isoformat() if days else None
+        await db.execute(
+            "INSERT INTO users (user_id, username, user_uuid, path, "
+            "created_at, expires_at, is_active) "
+            "VALUES (?, ?, ?, ?, ?, ?, 1)",
+            (user_id, username, user_uuid, user_path, now.isoformat(), expires_at)
+        )
+        await db.commit()
+        await sync_user_to_servers(user_uuid, user_path, "add")
+        await restart_xray()
+        return user_path, user_uuid
 
 
 async def activate_key(key, user_id, username):
-    result = db_request([f"SELECT id, is_used, days, is_revoked FROM keys WHERE key = '{key}'"])
-    row = None
-    if result:
-        try:
-            rows = result[0].get("results", {}).get("rows", [])
-            if rows:
-                row = rows[0]
-        except:
-            pass
-    
-    if not row:
-        return None, "Ключ не найден"
-    
-    key_id, is_used, days, is_revoked = row
-    
-    if is_revoked:
-        return None, "Ключ аннулирован"
-    if is_used:
-        return None, "Ключ уже использован"
-    
-    now = datetime.now().isoformat()
-    username_safe = username.replace("'", "''") if username else ""
-    db_request([f"UPDATE keys SET is_used = 1, used_by = {user_id}, used_by_username = '{username_safe}', activated_at = '{now}' WHERE key = '{key}'"])
-    
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT id, is_used, days, is_revoked FROM keys WHERE key = ?",
+            (key,)
+        )
+        row = await cursor.fetchone()
+        if not row:
+            return None, "Ключ не найден"
+        key_id, is_used, days, is_revoked = row
+        if is_revoked:
+            return None, "Ключ аннулирован"
+        if is_used:
+            return None, "Ключ уже использован"
+
+        now = datetime.now()
+        await db.execute(
+            "UPDATE keys SET is_used = 1, used_by = ?, "
+            "used_by_username = ?, activated_at = ? WHERE key = ?",
+            (user_id, username, now.isoformat(), key)
+        )
+        await db.commit()
+
     path, user_uuid = await create_subscription(user_id, username, days)
-    
-    result = db_request([f"SELECT expires_at FROM users WHERE user_id = {user_id}"])
-    actual_expires = None
-    if result:
-        try:
-            rows = result[0].get("results", {}).get("rows", [])
-            if rows:
-                actual_expires = rows[0][0]
-        except:
-            pass
-    
-    if actual_expires:
-        db_request([f"UPDATE keys SET expires_at = '{actual_expires}' WHERE id = {key_id}"])
-    
-    db_request([f"UPDATE users SET key_id = {key_id} WHERE user_id = {user_id}"])
-    
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT expires_at FROM users WHERE user_id = ?", (user_id,)
+        )
+        user_row = await cursor.fetchone()
+        actual_expires = user_row[0] if user_row else None
+        await db.execute(
+            "UPDATE keys SET expires_at = ? WHERE id = ?",
+            (actual_expires, key_id)
+        )
+        await db.execute(
+            "UPDATE users SET key_id = ? WHERE user_id = ?",
+            (key_id, user_id)
+        )
+        await db.commit()
+
     return path, None
 
 
 async def cleanup_expired():
     now = datetime.now().isoformat()
-    result = db_request([f"SELECT user_uuid, path FROM users WHERE expires_at IS NOT NULL AND expires_at < '{now}'"])
-    
-    expired = []
-    if result:
-        try:
-            rows = result[0].get("results", {}).get("rows", [])
-            expired = rows
-        except:
-            pass
-    
-    if expired:
-        db_request([f"DELETE FROM users WHERE expires_at IS NOT NULL AND expires_at < '{now}'"])
-    
-    for row in expired:
-        user_uuid, path = row
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT user_uuid, path FROM users "
+            "WHERE expires_at IS NOT NULL AND expires_at < ?",
+            (now,)
+        )
+        expired = await cursor.fetchall()
+        if expired:
+            await db.execute(
+                "DELETE FROM users "
+                "WHERE expires_at IS NOT NULL AND expires_at < ?",
+                (now,)
+            )
+            await db.commit()
+    for user_uuid, path in expired:
         await sync_user_to_servers(user_uuid, path, "remove")
-    
     return len(expired)
 
 
-def get_user_info(user_id):
-    result = db_request([f"SELECT path, user_uuid, is_active, expires_at FROM users WHERE user_id = {user_id}"])
-    if result:
-        try:
-            rows = result[0].get("results", {}).get("rows", [])
-            if rows:
-                return rows[0]
-        except:
-            pass
-    return None
+async def get_user_info(user_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT path, user_uuid, is_active, expires_at "
+            "FROM users WHERE user_id = ?",
+            (user_id,)
+        )
+        return await cursor.fetchone()
 
 
-def get_all_users():
-    result = db_request(["SELECT user_uuid, path FROM users WHERE is_active = 1"])
-    if result:
-        try:
-            rows = result[0].get("results", {}).get("rows", [])
-            return rows
-        except:
-            pass
-    return []
+async def get_all_users():
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT user_uuid, path FROM users WHERE is_active = 1"
+        )
+        return await cursor.fetchall()
 
 
-def get_stats():
-    active = 0
-    free_keys = 0
-    total_keys = 0
-    total_stars = 0
-    total_refs = 0
-    total_payments = 0
-    
-    result = db_request(["SELECT COUNT(*) FROM users"])
-    if result:
-        try:
-            rows = result[0].get("results", {}).get("rows", [])
-            if rows:
-                active = rows[0][0]
-        except:
-            pass
-    
-    result = db_request(["SELECT COUNT(*) FROM keys WHERE is_used = 0 AND is_revoked = 0"])
-    if result:
-        try:
-            rows = result[0].get("results", {}).get("rows", [])
-            if rows:
-                free_keys = rows[0][0]
-        except:
-            pass
-    
-    result = db_request(["SELECT COUNT(*) FROM keys"])
-    if result:
-        try:
-            rows = result[0].get("results", {}).get("rows", [])
-            if rows:
-                total_keys = rows[0][0]
-        except:
-            pass
-    
-    result = db_request(["SELECT SUM(amount) FROM payments"])
-    if result:
-        try:
-            rows = result[0].get("results", {}).get("rows", [])
-            if rows and rows[0][0]:
-                total_stars = rows[0][0]
-        except:
-            pass
-    
-    result = db_request(["SELECT COUNT(*) FROM referrals"])
-    if result:
-        try:
-            rows = result[0].get("results", {}).get("rows", [])
-            if rows:
-                total_refs = rows[0][0]
-        except:
-            pass
-    
-    result = db_request(["SELECT COUNT(*) FROM payments"])
-    if result:
-        try:
-            rows = result[0].get("results", {}).get("rows", [])
-            if rows:
-                total_payments = rows[0][0]
-        except:
-            pass
-    
-    return active, free_keys, total_keys, total_stars, total_refs, total_payments
+async def get_stats():
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT COUNT(*) FROM users")
+        active = (await cursor.fetchone())[0]
+        cursor = await db.execute(
+            "SELECT COUNT(*) FROM keys WHERE is_used = 0 AND is_revoked = 0"
+        )
+        free_keys = (await cursor.fetchone())[0]
+        cursor = await db.execute("SELECT COUNT(*) FROM keys")
+        total_keys = (await cursor.fetchone())[0]
+        cursor = await db.execute("SELECT SUM(amount) FROM payments")
+        row = await cursor.fetchone()
+        total_stars = row[0] if row[0] else 0
+        cursor = await db.execute("SELECT COUNT(*) FROM referrals")
+        total_refs = (await cursor.fetchone())[0]
+        cursor = await db.execute("SELECT COUNT(*) FROM payments")
+        total_payments = (await cursor.fetchone())[0]
+        return active, free_keys, total_keys, total_stars, total_refs, total_payments
 
 
-def get_keys_list():
-    result = db_request(["SELECT id, key, days, is_used, used_by_username, expires_at, is_revoked FROM keys ORDER BY id DESC LIMIT 20"])
-    if result:
-        try:
-            rows = result[0].get("results", {}).get("rows", [])
-            return rows
-        except:
-            pass
-    return []
+async def get_keys_list():
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT id, key, days, is_used, used_by_username, "
+            "expires_at, is_revoked "
+            "FROM keys ORDER BY id DESC LIMIT 20"
+        )
+        return await cursor.fetchall()
 
 
-def get_key_info(key_id):
-    result = db_request([f"SELECT id, key, days, is_used, used_by_username, expires_at, is_revoked FROM keys WHERE id = {key_id}"])
-    if result:
-        try:
-            rows = result[0].get("results", {}).get("rows", [])
-            if rows:
-                return rows[0]
-        except:
-            pass
-    return None
+async def get_key_info(key_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT id, key, days, is_used, used_by_username, "
+            "expires_at, is_revoked "
+            "FROM keys WHERE id = ?",
+            (key_id,)
+        )
+        return await cursor.fetchone()
 
 
 async def delete_key(key_id):
-    result = db_request([f"SELECT user_uuid, path FROM users WHERE key_id = {key_id}"])
-    user_info = None
-    if result:
-        try:
-            rows = result[0].get("results", {}).get("rows", [])
-            if rows:
-                user_info = rows[0]
-        except:
-            pass
-    
-    db_request([f"UPDATE keys SET is_revoked = 1 WHERE id = {key_id}"])
-    
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT user_uuid, path FROM users WHERE key_id = ?", (key_id,)
+        )
+        user_info = await cursor.fetchone()
+        await db.execute(
+            "UPDATE keys SET is_revoked = 1 WHERE id = ?", (key_id,)
+        )
+        if user_info:
+            await db.execute(
+                "DELETE FROM users WHERE key_id = ?", (key_id,)
+            )
+        await db.commit()
     if user_info:
-        db_request([f"DELETE FROM users WHERE key_id = {key_id}"])
         await sync_user_to_servers(user_info[0], user_info[1], "remove")
-    
     await restart_xray()
 
 
-def save_payment(user_id, username, amount, plan):
-    now = datetime.now().isoformat()
-    username_safe = username.replace("'", "''") if username else ""
-    db_request([f"INSERT INTO payments (user_id, username, amount, plan, created_at) VALUES ({user_id}, '{username_safe}', {amount}, '{plan}', '{now}')"])
+async def save_payment(user_id, username, amount, plan):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO payments (user_id, username, amount, plan, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (user_id, username, amount, plan, datetime.now().isoformat())
+        )
+        await db.commit()
 
 
-def generate_xray_config():
-    users = get_all_users()
-    clients = [{"id": row[0], "level": 0} for row in users]
+async def generate_xray_config():
+    users = await get_all_users()
+    clients = [{"id": user_uuid, "level": 0} for user_uuid, path in users]
     if not clients:
         clients.append({"id": str(uuid.uuid4()), "level": 0})
     config = {
@@ -671,7 +566,7 @@ def stop_xray():
 
 async def restart_xray():
     stop_xray()
-    generate_xray_config()
+    await generate_xray_config()
     await asyncio.sleep(1)
     start_xray()
     await asyncio.sleep(2)
@@ -688,16 +583,13 @@ async def handle_health(request):
 
 async def handle_subscription(request):
     path = request.match_info["path"]
-    result = db_request([f"SELECT user_uuid, is_active, expires_at FROM users WHERE path = '{path}'"])
-    row = None
-    if result:
-        try:
-            rows = result[0].get("results", {}).get("rows", [])
-            if rows:
-                row = rows[0]
-        except:
-            pass
-    
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT user_uuid, is_active, expires_at "
+            "FROM users WHERE path = ?",
+            (path,)
+        )
+        row = await cursor.fetchone()
     if not row:
         return web.Response(text="Not found", status=404)
     if not row[1]:
@@ -766,8 +658,7 @@ def main_kb(admin=False):
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
-def buy_kb(user_id):
-    trial_used = check_trial_used(user_id)
+def buy_kb(user_id, trial_used):
     buttons = []
     if not trial_used:
         buttons.append([InlineKeyboardButton(text="Пробный период (3 дня)", callback_data="trial")])
@@ -880,13 +771,13 @@ async def cmd_start(msg: types.Message, command: CommandObject, state: FSMContex
         except:
             referrer_id = None
 
-    user_exists = check_user_exists(user_id)
+    user_exists = await check_user_exists(user_id)
 
     if referrer_id and not user_exists:
-        save_referral(referrer_id, user_id)
+        await save_referral(referrer_id, user_id)
         trial_days = TRIAL_DAYS_REFERRAL
         path, user_uuid = await activate_trial(user_id, username, trial_days)
-        give_referral_bonus(referrer_id, user_id)
+        await give_referral_bonus(referrer_id, user_id)
         await restart_xray()
 
         link = generate_vless_link_multi(user_uuid, SERVERS[0])
@@ -923,15 +814,16 @@ async def go_back(cb: types.CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data == "buy")
 async def buy_menu(cb: types.CallbackQuery):
+    trial_used = await check_trial_used(cb.from_user.id)
     text = "<b>Купить подписку</b>\n\nВыберите тариф:\n\n1 неделя - 5 звёзд\n1 месяц - 10 звёзд\n1 год - 100 звёзд\nНавсегда - 300 звёзд\n\nОплата через Telegram Stars"
-    kb = buy_kb(cb.from_user.id)
+    kb = buy_kb(cb.from_user.id, trial_used)
     await safe_edit(cb.message, text, kb)
     await cb.answer()
 
 
 @dp.callback_query(F.data == "trial")
 async def trial_menu(cb: types.CallbackQuery):
-    trial_used = check_trial_used(cb.from_user.id)
+    trial_used = await check_trial_used(cb.from_user.id)
     if trial_used:
         await cb.answer("Вы уже использовали пробный период!", show_alert=True)
         return
@@ -944,7 +836,7 @@ async def trial_menu(cb: types.CallbackQuery):
 async def trial_confirm(cb: types.CallbackQuery):
     user_id = cb.from_user.id
     username = cb.from_user.username or cb.from_user.first_name
-    trial_used = check_trial_used(user_id)
+    trial_used = await check_trial_used(user_id)
     if trial_used:
         await cb.answer("Вы уже использовали пробный период!", show_alert=True)
         return
@@ -964,7 +856,7 @@ async def trial_confirm(cb: types.CallbackQuery):
 @dp.callback_query(F.data == "referral")
 async def referral_menu(cb: types.CallbackQuery):
     user_id = cb.from_user.id
-    count, referred_by = get_referral_stats(user_id)
+    count, referred_by = await get_referral_stats(user_id)
     ref_link = f"https://t.me/{BOT_USERNAME}?start=ref_{user_id}"
 
     text = f"<b>Реферальная система</b>\n\nПриглашайте друзей и получайте бонусы!\n\nЗа каждого приглашённого друга вы получите <b>+{REFERRAL_BONUS_DAYS} дня</b> к подписке.\nВаш друг получит <b>{TRIAL_DAYS_REFERRAL} дней</b> пробного периода!\n\nПриглашено людей: <b>{count}</b>\n"
@@ -1005,11 +897,11 @@ async def successful_payment(msg: types.Message):
     days = price_info["days"]
     stars = price_info["stars"]
     username = msg.from_user.username or msg.from_user.first_name
-    save_payment(msg.from_user.id, username, stars, plan)
+    await save_payment(msg.from_user.id, username, stars, plan)
     path, user_uuid = await create_subscription(msg.from_user.id, username, days)
     await restart_xray()
 
-    info = get_user_info(msg.from_user.id)
+    info = await get_user_info(msg.from_user.id)
     if not info:
         await msg.answer("Ошибка создания подписки")
         return
@@ -1041,7 +933,7 @@ async def process_key(msg: types.Message, state: FSMContext):
     if error:
         await safe_send(msg, "Ошибка: " + error, back_kb())
         return
-    info = get_user_info(msg.from_user.id)
+    info = await get_user_info(msg.from_user.id)
     if not info:
         await safe_send(msg, "Ошибка", back_kb())
         return
@@ -1059,7 +951,7 @@ async def process_key(msg: types.Message, state: FSMContext):
 
 @dp.callback_query(F.data == "mysub")
 async def my_sub(cb: types.CallbackQuery):
-    info = get_user_info(cb.from_user.id)
+    info = await get_user_info(cb.from_user.id)
     if not info:
         text = "<b>У вас нет подписки</b>\n\nКупите или активируйте ключ."
         await safe_edit(cb.message, text, back_kb())
@@ -1077,7 +969,9 @@ async def my_sub(cb: types.CallbackQuery):
             pass
 
     if is_expired:
-        db_request([f"DELETE FROM users WHERE user_id = {cb.from_user.id}"])
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("DELETE FROM users WHERE user_id = ?", (cb.from_user.id,))
+            await db.commit()
         await sync_user_to_servers(user_uuid, user_path, "remove")
         text = "<b>Ваша подписка истекла</b>\n\nКупите новую подписку или активируйте ключ."
         await safe_edit(cb.message, text, back_kb())
@@ -1104,7 +998,7 @@ async def admin_panel(cb: types.CallbackQuery, state: FSMContext):
         await cb.answer("Нет доступа", show_alert=True)
         return
     await state.clear()
-    active, free_keys, total_keys, total_stars, total_refs, total_payments = get_stats()
+    active, free_keys, total_keys, total_stars, total_refs, total_payments = await get_stats()
     xray_ok = xray_process is not None and xray_process.poll() is None
     xray_status = "Работает" if xray_ok else "Остановлен"
     text = f"<b>Админ-панель</b>\n\nАктивных подписок: {active}\nКлючей свободно: {free_keys} / {total_keys}\nЗаработано звёзд: {total_stars}\nРефералов: {total_refs}\nОплат всего: {total_payments}\nXray: {xray_status}"
@@ -1132,7 +1026,7 @@ async def create_key_handler(cb: types.CallbackQuery, state: FSMContext):
     days = None if val == "0" else int(val)
     days_str = "Бессрочно" if days is None else str(days) + " дней"
     await state.clear()
-    key, key_id = create_key(days)
+    key, key_id = await create_key(days)
     text = f"<b>Ключ создан!</b>\n\nID: #{key_id}\nКлюч: <code>{key}</code>\nСрок: {days_str}"
     await safe_edit(cb.message, text, back_admin_kb())
     await cb.answer()
@@ -1151,7 +1045,7 @@ async def process_days_manual(msg: types.Message, state: FSMContext):
         await safe_send(msg, "Введите число", back_admin_kb())
         return
     await state.clear()
-    key, key_id = create_key(days)
+    key, key_id = await create_key(days)
     text = f"<b>Ключ создан!</b>\n\nID: #{key_id}\nКлюч: <code>{key}</code>\nСрок: {days} дней"
     await safe_send(msg, text, back_admin_kb())
 
@@ -1161,7 +1055,7 @@ async def list_keys(cb: types.CallbackQuery):
     if not is_admin(cb.from_user):
         await cb.answer("Нет доступа", show_alert=True)
         return
-    keys = get_keys_list()
+    keys = await get_keys_list()
     if not keys:
         await safe_edit(cb.message, "<b>Ключей нет</b>", back_admin_kb())
         await cb.answer()
@@ -1190,7 +1084,7 @@ async def key_info(cb: types.CallbackQuery):
         await cb.answer("Нет доступа", show_alert=True)
         return
     key_id = int(cb.data.replace("keyinfo_", ""))
-    info = get_key_info(key_id)
+    info = await get_key_info(key_id)
     if not info:
         await cb.answer("Ключ не найден", show_alert=True)
         return
@@ -1230,7 +1124,7 @@ async def stats_handler(cb: types.CallbackQuery):
     if not is_admin(cb.from_user):
         await cb.answer("Нет доступа", show_alert=True)
         return
-    active, free_keys, total_keys, total_stars, total_refs, total_payments = get_stats()
+    active, free_keys, total_keys, total_stars, total_refs, total_payments = await get_stats()
     text = f"<b>Статистика</b>\n\n<b>Подписки:</b>\nАктивных: {active}\n\n<b>Ключи:</b>\nСвободных: {free_keys}\nВсего: {total_keys}\n\n<b>Доход:</b>\nВсего звёзд: {total_stars}\nОплат: {total_payments}\n\n<b>Рефералы:</b>\nВсего приглашений: {total_refs}"
     await safe_edit(cb.message, text, back_admin_kb())
     await cb.answer()
@@ -1260,24 +1154,6 @@ async def check_stars(msg: types.Message):
         await msg.answer(f"<b>Баланс звёзд</b>\n\nТранзакций: {count}\nВсего звёзд: {total} ⭐\nДо вывода: {max(0, 1000 - total)} ⭐", parse_mode="HTML")
     except Exception as e:
         await msg.answer(f"Ошибка: {e}")
-
-
-@dp.message(F.text == "/testdb")
-async def test_db(msg: types.Message):
-    if not is_admin(msg.from_user):
-        return
-    
-    test_key = "TEST-" + secrets.token_hex(4).upper()
-    now = datetime.now().isoformat()
-    
-    result1 = db_request([f"INSERT INTO keys (key, days, created_at, is_used, is_revoked) VALUES ('{test_key}', 7, '{now}', 0, 0)"])
-    await msg.answer(f"INSERT result:\n<code>{json.dumps(result1, indent=2)[:1000]}</code>", parse_mode="HTML")
-    
-    result2 = db_request([f"SELECT id, key, days FROM keys WHERE key = '{test_key}'"])
-    await msg.answer(f"SELECT result:\n<code>{json.dumps(result2, indent=2)[:1000]}</code>", parse_mode="HTML")
-    
-    result3 = db_request(["SELECT id, key, days FROM keys ORDER BY id DESC LIMIT 5"])
-    await msg.answer(f"ALL KEYS:\n<code>{json.dumps(result3, indent=2)[:1000]}</code>", parse_mode="HTML")
 
 
 async def run_bot():
@@ -1311,9 +1187,8 @@ async def expiry_checker():
 
 async def main():
     print("NEFRIT VPN MASTER SERVER")
-    print(f"Turso URL: {TURSO_URL}")
-    init_db()
-    generate_xray_config()
+    await init_db()
+    await generate_xray_config()
     start_xray()
     await asyncio.sleep(3)
     await asyncio.gather(run_web(), run_bot(), expiry_checker())
