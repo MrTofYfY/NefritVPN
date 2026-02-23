@@ -5,10 +5,10 @@ import base64
 import asyncio
 import secrets
 import subprocess
+import httpx
 from pathlib import Path
 from datetime import datetime, timedelta
 from aiohttp import web, WSMsgType, ClientSession
-import libsql_experimental as libsql
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart, CommandObject
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
@@ -95,64 +95,102 @@ class States(StatesGroup):
     waiting_days = State()
 
 
-def get_db():
-    return libsql.connect(TURSO_URL, auth_token=TURSO_TOKEN)
-
-
 def generate_path():
     return secrets.token_urlsafe(12)
 
 
+def get_turso_http_url():
+    url = TURSO_URL.replace("libsql://", "https://")
+    return url
+
+
+def db_execute(sql, params=None):
+    url = get_turso_http_url()
+    headers = {
+        "Authorization": f"Bearer {TURSO_TOKEN}",
+        "Content-Type": "application/json"
+    }
+    
+    if params:
+        stmt = {"q": sql, "params": list(params)}
+    else:
+        stmt = {"q": sql}
+    
+    body = {"statements": [stmt]}
+    
+    with httpx.Client(timeout=30) as client:
+        resp = client.post(url, json=body, headers=headers)
+        if resp.status_code != 200:
+            print(f"DB Error: {resp.status_code} {resp.text}")
+            return None
+        return resp.json()
+
+
+def db_query(sql, params=None):
+    result = db_execute(sql, params)
+    if not result:
+        return []
+    try:
+        rows = result[0]["results"]["rows"]
+        return rows
+    except (KeyError, IndexError):
+        return []
+
+
+def db_query_one(sql, params=None):
+    rows = db_query(sql, params)
+    return rows[0] if rows else None
+
+
 def init_db():
-    with get_db() as db:
-        db.execute(
-            "CREATE TABLE IF NOT EXISTS users ("
-            "id INTEGER PRIMARY KEY, "
-            "user_id INTEGER UNIQUE, "
-            "username TEXT, "
-            "user_uuid TEXT UNIQUE, "
-            "path TEXT UNIQUE, "
-            "key_id INTEGER, "
-            "created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, "
-            "expires_at TIMESTAMP, "
-            "is_active BOOLEAN DEFAULT 1, "
-            "referred_by INTEGER DEFAULT NULL)"
-        )
-        db.execute(
-            "CREATE TABLE IF NOT EXISTS trial_used ("
-            "user_id INTEGER PRIMARY KEY)"
-        )
-        db.execute(
-            "CREATE TABLE IF NOT EXISTS keys ("
-            "id INTEGER PRIMARY KEY AUTOINCREMENT, "
-            "key TEXT UNIQUE, "
-            "days INTEGER, "
-            "is_used BOOLEAN DEFAULT 0, "
-            "used_by INTEGER, "
-            "used_by_username TEXT, "
-            "created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, "
-            "activated_at TIMESTAMP, "
-            "expires_at TIMESTAMP, "
-            "is_revoked BOOLEAN DEFAULT 0)"
-        )
-        db.execute(
-            "CREATE TABLE IF NOT EXISTS payments ("
-            "id INTEGER PRIMARY KEY AUTOINCREMENT, "
-            "user_id INTEGER, "
-            "username TEXT, "
-            "amount INTEGER, "
-            "plan TEXT, "
-            "created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)"
-        )
-        db.execute(
-            "CREATE TABLE IF NOT EXISTS referrals ("
-            "id INTEGER PRIMARY KEY AUTOINCREMENT, "
-            "referrer_id INTEGER, "
-            "referred_id INTEGER UNIQUE, "
-            "created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, "
-            "bonus_given BOOLEAN DEFAULT 0)"
-        )
-        db.commit()
+    db_execute(
+        "CREATE TABLE IF NOT EXISTS users ("
+        "id INTEGER PRIMARY KEY, "
+        "user_id INTEGER UNIQUE, "
+        "username TEXT, "
+        "user_uuid TEXT UNIQUE, "
+        "path TEXT UNIQUE, "
+        "key_id INTEGER, "
+        "created_at TEXT, "
+        "expires_at TEXT, "
+        "is_active INTEGER DEFAULT 1, "
+        "referred_by INTEGER DEFAULT NULL)"
+    )
+    db_execute(
+        "CREATE TABLE IF NOT EXISTS trial_used ("
+        "user_id INTEGER PRIMARY KEY)"
+    )
+    db_execute(
+        "CREATE TABLE IF NOT EXISTS keys ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+        "key TEXT UNIQUE, "
+        "days INTEGER, "
+        "is_used INTEGER DEFAULT 0, "
+        "used_by INTEGER, "
+        "used_by_username TEXT, "
+        "created_at TEXT, "
+        "activated_at TEXT, "
+        "expires_at TEXT, "
+        "is_revoked INTEGER DEFAULT 0)"
+    )
+    db_execute(
+        "CREATE TABLE IF NOT EXISTS payments ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+        "user_id INTEGER, "
+        "username TEXT, "
+        "amount INTEGER, "
+        "plan TEXT, "
+        "created_at TEXT)"
+    )
+    db_execute(
+        "CREATE TABLE IF NOT EXISTS referrals ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+        "referrer_id INTEGER, "
+        "referred_id INTEGER UNIQUE, "
+        "created_at TEXT, "
+        "bonus_given INTEGER DEFAULT 0)"
+    )
+    print("Database initialized")
 
 
 async def sync_user_to_servers(user_uuid, user_path, action="add"):
@@ -203,331 +241,285 @@ def generate_subscription_multi(user_uuid, user_path):
 def create_key(days=None):
     key = "NEFRIT-" + secrets.token_hex(8).upper()
     now = datetime.now().isoformat()
-    with get_db() as db:
-        db.execute(
-            "INSERT INTO keys (key, days, created_at) VALUES (?, ?, ?)",
-            (key, days, now)
-        )
-        db.commit()
-        cursor = db.execute("SELECT id FROM keys WHERE key = ?", (key,))
-        row = cursor.fetchone()
-        key_id = row[0] if row else 0
+    db_execute(
+        "INSERT INTO keys (key, days, created_at) VALUES (?, ?, ?)",
+        (key, days, now)
+    )
+    row = db_query_one("SELECT id FROM keys WHERE key = ?", (key,))
+    key_id = row[0] if row else 0
     return key, key_id
 
 
 def check_trial_used(user_id):
-    with get_db() as db:
-        cursor = db.execute(
-            "SELECT 1 FROM trial_used WHERE user_id = ?", (user_id,)
-        )
-        return cursor.fetchone() is not None
+    row = db_query_one(
+        "SELECT 1 FROM trial_used WHERE user_id = ?", (user_id,)
+    )
+    return row is not None
 
 
 async def activate_trial(user_id, username, days):
-    with get_db() as db:
-        db.execute(
-            "INSERT OR IGNORE INTO trial_used (user_id) VALUES (?)", (user_id,)
-        )
-        db.commit()
+    db_execute(
+        "INSERT OR IGNORE INTO trial_used (user_id) VALUES (?)", (user_id,)
+    )
     return await create_subscription(user_id, username, days)
 
 
 def add_days_to_user(user_id, days):
-    with get_db() as db:
-        cursor = db.execute(
-            "SELECT expires_at FROM users WHERE user_id = ?", (user_id,)
-        )
-        row = cursor.fetchone()
-        if not row:
-            return False
-        now = datetime.now()
-        old_expires = row[0]
-        if old_expires is None:
-            return True
-        try:
-            old_exp = datetime.fromisoformat(old_expires)
-            base = old_exp if old_exp > now else now
-            new_expires = (base + timedelta(days=days)).isoformat()
-        except:
-            new_expires = (now + timedelta(days=days)).isoformat()
-        db.execute(
-            "UPDATE users SET expires_at = ?, is_active = 1 WHERE user_id = ?",
-            (new_expires, user_id)
-        )
-        db.commit()
+    row = db_query_one(
+        "SELECT expires_at FROM users WHERE user_id = ?", (user_id,)
+    )
+    if not row:
+        return False
+    now = datetime.now()
+    old_expires = row[0]
+    if old_expires is None:
         return True
+    try:
+        old_exp = datetime.fromisoformat(old_expires)
+        base = old_exp if old_exp > now else now
+        new_expires = (base + timedelta(days=days)).isoformat()
+    except:
+        new_expires = (now + timedelta(days=days)).isoformat()
+    db_execute(
+        "UPDATE users SET expires_at = ?, is_active = 1 WHERE user_id = ?",
+        (new_expires, user_id)
+    )
+    return True
 
 
 def save_referral(referrer_id, referred_id):
-    with get_db() as db:
-        try:
-            db.execute(
-                "INSERT INTO referrals (referrer_id, referred_id, created_at) "
-                "VALUES (?, ?, ?)",
-                (referrer_id, referred_id, datetime.now().isoformat())
-            )
-            db.commit()
-            return True
-        except:
-            return False
-
-
-def give_referral_bonus(referrer_id, referred_id):
-    with get_db() as db:
-        cursor = db.execute(
-            "SELECT bonus_given FROM referrals "
-            "WHERE referrer_id = ? AND referred_id = ?",
-            (referrer_id, referred_id)
+    try:
+        db_execute(
+            "INSERT INTO referrals (referrer_id, referred_id, created_at) "
+            "VALUES (?, ?, ?)",
+            (referrer_id, referred_id, datetime.now().isoformat())
         )
-        row = cursor.fetchone()
-        if row and row[0] == 0:
-            add_days_to_user(referrer_id, REFERRAL_BONUS_DAYS)
-            db.execute(
-                "UPDATE referrals SET bonus_given = 1 "
-                "WHERE referrer_id = ? AND referred_id = ?",
-                (referrer_id, referred_id)
-            )
-            db.commit()
-            return True
+        return True
+    except:
         return False
 
 
+def give_referral_bonus(referrer_id, referred_id):
+    row = db_query_one(
+        "SELECT bonus_given FROM referrals "
+        "WHERE referrer_id = ? AND referred_id = ?",
+        (referrer_id, referred_id)
+    )
+    if row and row[0] == 0:
+        add_days_to_user(referrer_id, REFERRAL_BONUS_DAYS)
+        db_execute(
+            "UPDATE referrals SET bonus_given = 1 "
+            "WHERE referrer_id = ? AND referred_id = ?",
+            (referrer_id, referred_id)
+        )
+        return True
+    return False
+
+
 def get_referral_stats(user_id):
-    with get_db() as db:
-        cursor = db.execute(
-            "SELECT COUNT(*) FROM referrals WHERE referrer_id = ?", (user_id,)
-        )
-        count = cursor.fetchone()[0]
-        cursor = db.execute(
-            "SELECT referrer_id FROM referrals WHERE referred_id = ?", (user_id,)
-        )
-        row = cursor.fetchone()
-        referred_by = row[0] if row else None
-        return count, referred_by
+    row = db_query_one(
+        "SELECT COUNT(*) FROM referrals WHERE referrer_id = ?", (user_id,)
+    )
+    count = row[0] if row else 0
+    row2 = db_query_one(
+        "SELECT referrer_id FROM referrals WHERE referred_id = ?", (user_id,)
+    )
+    referred_by = row2[0] if row2 else None
+    return count, referred_by
 
 
 def check_user_exists(user_id):
-    with get_db() as db:
-        cursor = db.execute(
-            "SELECT id FROM users WHERE user_id = ?", (user_id,)
-        )
-        return cursor.fetchone() is not None
+    row = db_query_one(
+        "SELECT id FROM users WHERE user_id = ?", (user_id,)
+    )
+    return row is not None
 
 
 async def create_subscription(user_id, username, days=None):
-    with get_db() as db:
-        cursor = db.execute(
-            "SELECT path, user_uuid, expires_at FROM users WHERE user_id = ?",
-            (user_id,)
-        )
-        existing = cursor.fetchone()
-        now = datetime.now()
+    existing = db_query_one(
+        "SELECT path, user_uuid, expires_at FROM users WHERE user_id = ?",
+        (user_id,)
+    )
+    now = datetime.now()
 
-        if existing:
-            old_path, old_uuid, old_expires = existing
+    if existing:
+        old_path, old_uuid, old_expires = existing
 
-            is_expired = False
-            if old_expires:
-                try:
-                    is_expired = datetime.fromisoformat(old_expires) <= now
-                except:
-                    pass
+        is_expired = False
+        if old_expires:
+            try:
+                is_expired = datetime.fromisoformat(old_expires) <= now
+            except:
+                pass
 
-            if not is_expired:
-                if old_expires is None:
-                    new_expires = None
-                elif days is None:
-                    new_expires = None
-                else:
-                    old_exp = datetime.fromisoformat(old_expires)
-                    new_expires = (old_exp + timedelta(days=days)).isoformat()
-                db.execute(
-                    "UPDATE users SET expires_at = ?, is_active = 1 "
-                    "WHERE user_id = ?",
-                    (new_expires, user_id)
-                )
-                db.commit()
-                await sync_user_to_servers(old_uuid, old_path, "add")
-                return old_path, old_uuid
+        if not is_expired:
+            if old_expires is None:
+                new_expires = None
+            elif days is None:
+                new_expires = None
             else:
-                db.execute(
-                    "DELETE FROM users WHERE user_id = ?", (user_id,)
-                )
-                db.commit()
-                await sync_user_to_servers(old_uuid, old_path, "remove")
+                old_exp = datetime.fromisoformat(old_expires)
+                new_expires = (old_exp + timedelta(days=days)).isoformat()
+            db_execute(
+                "UPDATE users SET expires_at = ?, is_active = 1 "
+                "WHERE user_id = ?",
+                (new_expires, user_id)
+            )
+            await sync_user_to_servers(old_uuid, old_path, "add")
+            return old_path, old_uuid
+        else:
+            db_execute(
+                "DELETE FROM users WHERE user_id = ?", (user_id,)
+            )
+            await sync_user_to_servers(old_uuid, old_path, "remove")
 
-        user_uuid = str(uuid.uuid4())
-        user_path = generate_path()
-        expires_at = (now + timedelta(days=days)).isoformat() if days else None
-        db.execute(
-            "INSERT INTO users (user_id, username, user_uuid, path, "
-            "created_at, expires_at, is_active) "
-            "VALUES (?, ?, ?, ?, ?, ?, 1)",
-            (user_id, username, user_uuid, user_path,
-             now.isoformat(), expires_at)
-        )
-        db.commit()
-        await sync_user_to_servers(user_uuid, user_path, "add")
-        await restart_xray()
-        return user_path, user_uuid
+    user_uuid = str(uuid.uuid4())
+    user_path = generate_path()
+    expires_at = (now + timedelta(days=days)).isoformat() if days else None
+    db_execute(
+        "INSERT INTO users (user_id, username, user_uuid, path, "
+        "created_at, expires_at, is_active) "
+        "VALUES (?, ?, ?, ?, ?, ?, 1)",
+        (user_id, username, user_uuid, user_path,
+         now.isoformat(), expires_at)
+    )
+    await sync_user_to_servers(user_uuid, user_path, "add")
+    await restart_xray()
+    return user_path, user_uuid
 
 
 async def activate_key(key, user_id, username):
-    with get_db() as db:
-        cursor = db.execute(
-            "SELECT id, is_used, days, is_revoked FROM keys WHERE key = ?",
-            (key,)
-        )
-        row = cursor.fetchone()
-        if not row:
-            return None, "Ключ не найден"
-        key_id, is_used, days, is_revoked = row
-        if is_revoked:
-            return None, "Ключ аннулирован"
-        if is_used:
-            return None, "Ключ уже использован"
+    row = db_query_one(
+        "SELECT id, is_used, days, is_revoked FROM keys WHERE key = ?",
+        (key,)
+    )
+    if not row:
+        return None, "Ключ не найден"
+    key_id, is_used, days, is_revoked = row
+    if is_revoked:
+        return None, "Ключ аннулирован"
+    if is_used:
+        return None, "Ключ уже использован"
 
-        now = datetime.now()
-        db.execute(
-            "UPDATE keys SET is_used = 1, used_by = ?, "
-            "used_by_username = ?, activated_at = ? WHERE key = ?",
-            (user_id, username, now.isoformat(), key)
-        )
-        db.commit()
+    now = datetime.now()
+    db_execute(
+        "UPDATE keys SET is_used = 1, used_by = ?, "
+        "used_by_username = ?, activated_at = ? WHERE key = ?",
+        (user_id, username, now.isoformat(), key)
+    )
 
     path, user_uuid = await create_subscription(user_id, username, days)
 
-    with get_db() as db:
-        cursor = db.execute(
-            "SELECT expires_at FROM users WHERE user_id = ?", (user_id,)
-        )
-        user_row = cursor.fetchone()
-        actual_expires = user_row[0] if user_row else None
-        db.execute(
-            "UPDATE keys SET expires_at = ? WHERE id = ?",
-            (actual_expires, key_id)
-        )
-        db.execute(
-            "UPDATE users SET key_id = ? WHERE user_id = ?",
-            (key_id, user_id)
-        )
-        db.commit()
+    user_row = db_query_one(
+        "SELECT expires_at FROM users WHERE user_id = ?", (user_id,)
+    )
+    actual_expires = user_row[0] if user_row else None
+    db_execute(
+        "UPDATE keys SET expires_at = ? WHERE id = ?",
+        (actual_expires, key_id)
+    )
+    db_execute(
+        "UPDATE users SET key_id = ? WHERE user_id = ?",
+        (key_id, user_id)
+    )
 
     return path, None
 
 
 async def cleanup_expired():
     now = datetime.now().isoformat()
-    with get_db() as db:
-        cursor = db.execute(
-            "SELECT user_uuid, path FROM users "
+    expired = db_query(
+        "SELECT user_uuid, path FROM users "
+        "WHERE expires_at IS NOT NULL AND expires_at < ?",
+        (now,)
+    )
+    if expired:
+        db_execute(
+            "DELETE FROM users "
             "WHERE expires_at IS NOT NULL AND expires_at < ?",
             (now,)
         )
-        expired = cursor.fetchall()
-        if expired:
-            db.execute(
-                "DELETE FROM users "
-                "WHERE expires_at IS NOT NULL AND expires_at < ?",
-                (now,)
-            )
-            db.commit()
-    for user_uuid, path in expired:
+    for row in expired:
+        user_uuid, path = row
         await sync_user_to_servers(user_uuid, path, "remove")
     return len(expired)
 
 
 def get_user_info(user_id):
-    with get_db() as db:
-        cursor = db.execute(
-            "SELECT path, user_uuid, is_active, expires_at "
-            "FROM users WHERE user_id = ?",
-            (user_id,)
-        )
-        return cursor.fetchone()
+    return db_query_one(
+        "SELECT path, user_uuid, is_active, expires_at "
+        "FROM users WHERE user_id = ?",
+        (user_id,)
+    )
 
 
 def get_all_users():
-    with get_db() as db:
-        cursor = db.execute(
-            "SELECT user_uuid, path FROM users WHERE is_active = 1"
-        )
-        return cursor.fetchall()
+    return db_query(
+        "SELECT user_uuid, path FROM users WHERE is_active = 1"
+    )
 
 
 def get_stats():
-    with get_db() as db:
-        cursor = db.execute("SELECT COUNT(*) FROM users")
-        active = cursor.fetchone()[0]
-        cursor = db.execute(
-            "SELECT COUNT(*) FROM keys WHERE is_used = 0 AND is_revoked = 0"
-        )
-        free_keys = cursor.fetchone()[0]
-        cursor = db.execute("SELECT COUNT(*) FROM keys")
-        total_keys = cursor.fetchone()[0]
-        cursor = db.execute("SELECT SUM(amount) FROM payments")
-        row = cursor.fetchone()
-        total_stars = row[0] if row[0] else 0
-        cursor = db.execute("SELECT COUNT(*) FROM referrals")
-        total_refs = cursor.fetchone()[0]
-        cursor = db.execute("SELECT COUNT(*) FROM payments")
-        total_payments = cursor.fetchone()[0]
-        return active, free_keys, total_keys, total_stars, total_refs, total_payments
+    row = db_query_one("SELECT COUNT(*) FROM users")
+    active = row[0] if row else 0
+    row = db_query_one(
+        "SELECT COUNT(*) FROM keys WHERE is_used = 0 AND is_revoked = 0"
+    )
+    free_keys = row[0] if row else 0
+    row = db_query_one("SELECT COUNT(*) FROM keys")
+    total_keys = row[0] if row else 0
+    row = db_query_one("SELECT SUM(amount) FROM payments")
+    total_stars = row[0] if row and row[0] else 0
+    row = db_query_one("SELECT COUNT(*) FROM referrals")
+    total_refs = row[0] if row else 0
+    row = db_query_one("SELECT COUNT(*) FROM payments")
+    total_payments = row[0] if row else 0
+    return active, free_keys, total_keys, total_stars, total_refs, total_payments
 
 
 def get_keys_list():
-    with get_db() as db:
-        cursor = db.execute(
-            "SELECT id, key, days, is_used, used_by_username, "
-            "expires_at, is_revoked "
-            "FROM keys ORDER BY id DESC LIMIT 20"
-        )
-        return cursor.fetchall()
+    return db_query(
+        "SELECT id, key, days, is_used, used_by_username, "
+        "expires_at, is_revoked "
+        "FROM keys ORDER BY id DESC LIMIT 20"
+    )
 
 
 def get_key_info(key_id):
-    with get_db() as db:
-        cursor = db.execute(
-            "SELECT id, key, days, is_used, used_by_username, "
-            "expires_at, is_revoked "
-            "FROM keys WHERE id = ?",
-            (key_id,)
-        )
-        return cursor.fetchone()
+    return db_query_one(
+        "SELECT id, key, days, is_used, used_by_username, "
+        "expires_at, is_revoked "
+        "FROM keys WHERE id = ?",
+        (key_id,)
+    )
 
 
 async def delete_key(key_id):
-    with get_db() as db:
-        cursor = db.execute(
-            "SELECT user_uuid, path FROM users WHERE key_id = ?", (key_id,)
-        )
-        user_info = cursor.fetchone()
-        db.execute(
-            "UPDATE keys SET is_revoked = 1 WHERE id = ?", (key_id,)
-        )
-        if user_info:
-            db.execute(
-                "DELETE FROM users WHERE key_id = ?", (key_id,)
-            )
-        db.commit()
+    user_info = db_query_one(
+        "SELECT user_uuid, path FROM users WHERE key_id = ?", (key_id,)
+    )
+    db_execute(
+        "UPDATE keys SET is_revoked = 1 WHERE id = ?", (key_id,)
+    )
     if user_info:
+        db_execute(
+            "DELETE FROM users WHERE key_id = ?", (key_id,)
+        )
         await sync_user_to_servers(user_info[0], user_info[1], "remove")
     await restart_xray()
 
 
 def save_payment(user_id, username, amount, plan):
-    with get_db() as db:
-        db.execute(
-            "INSERT INTO payments (user_id, username, amount, plan, created_at) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (user_id, username, amount, plan, datetime.now().isoformat())
-        )
-        db.commit()
+    db_execute(
+        "INSERT INTO payments (user_id, username, amount, plan, created_at) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (user_id, username, amount, plan, datetime.now().isoformat())
+    )
 
 
 def generate_xray_config():
     users = get_all_users()
-    clients = [{"id": user_uuid, "level": 0} for user_uuid, path in users]
+    clients = [{"id": row[0], "level": 0} for row in users]
     if not clients:
         clients.append({"id": str(uuid.uuid4()), "level": 0})
     config = {
@@ -590,13 +582,11 @@ async def handle_health(request):
 
 async def handle_subscription(request):
     path = request.match_info["path"]
-    with get_db() as db:
-        cursor = db.execute(
-            "SELECT user_uuid, is_active, expires_at "
-            "FROM users WHERE path = ?",
-            (path,)
-        )
-        row = cursor.fetchone()
+    row = db_query_one(
+        "SELECT user_uuid, is_active, expires_at "
+        "FROM users WHERE path = ?",
+        (path,)
+    )
     if not row:
         return web.Response(text="Not found", status=404)
     if not row[1]:
@@ -1095,11 +1085,9 @@ async def my_sub(cb: types.CallbackQuery):
             pass
 
     if is_expired:
-        with get_db() as db:
-            db.execute(
-                "DELETE FROM users WHERE user_id = ?", (cb.from_user.id,)
-            )
-            db.commit()
+        db_execute(
+            "DELETE FROM users WHERE user_id = ?", (cb.from_user.id,)
+        )
         await sync_user_to_servers(user_uuid, user_path, "remove")
         text = (
             "<b>Ваша подписка истекла</b>\n\n"
@@ -1394,6 +1382,7 @@ async def expiry_checker():
 
 async def main():
     print("NEFRIT VPN MASTER SERVER")
+    print(f"Turso URL: {TURSO_URL}")
     init_db()
     generate_xray_config()
     start_xray()
